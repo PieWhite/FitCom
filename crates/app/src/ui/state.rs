@@ -1,0 +1,2015 @@
+//! The view model the window reads.
+//!
+//! This is one half of the `Snapshot`/`UiCommand` boundary that survived the move off
+//! egui and then off the webview (see `docs/OVERDRACHT.md`, decision 19). The engine still
+//! publishes an immutable `Snapshot`; this module turns it into plain data the GPUI views
+//! render, and nothing else. The serde derives are what the debug fixture mode loads from
+//! JSON; `PartialEq` is what keeps an unchanged state from reaching the window at all. No decision about the network, the store or the media threads is taken
+//! here, and no state that matters lives here — the window may stop drawing entirely
+//! without anything going wrong.
+//!
+//! Field names are English, as is everything written for this layer. The engine keeps
+//! its Dutch identifiers; the translation happens exactly here, in one file, instead of
+//! being smeared across a rename of five crates that this phase is not allowed to touch.
+
+use crate::engine::{PeerView, Snapshot};
+use crate::files::{self, DownloadStatus};
+use crate::tags;
+use crate::updates::UpdateStatus;
+use crate::wordle;
+use fitcom_net::PeerStatus;
+use fitcom_proto::{Channel, OpId, PeerId, TopicId};
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::path::Path;
+
+/// How much of the parent's body rides along in a reply quote, in characters. Roughly
+/// one line; the full text is one click away.
+const REPLY_SNIPPET_LEN: usize = 90;
+
+/// How a `Channel` travels to the frontend and back: `general`, `topic:<uuid>` or
+/// `dm:<uuid>`. A string rather than a nested object because it is used as an object key
+/// and a `data-` attribute on nearly every row in the window.
+pub fn channel_key(channel: Channel) -> String {
+    if let Some(peer) = channel.dm_peer() {
+        format!("dm:{peer}")
+    } else if let Some(topic) = channel.topic_id() {
+        format!("topic:{}", topic.0)
+    } else {
+        "general".to_string()
+    }
+}
+
+/// Inverse of [`channel_key`]. An unparsable key falls back to the general channel
+/// rather than failing: the frontend can only produce keys this layer handed it, so a
+/// miss means a bug here, not input to validate.
+pub fn parse_channel(key: &str) -> Channel {
+    match key.split_once(':') {
+        Some(("dm", id)) => id
+            .parse::<uuid::Uuid>()
+            .map(|u| Channel::dm(PeerId(u)))
+            .unwrap_or(Channel::GENERAL),
+        Some(("topic", id)) => id
+            .parse::<uuid::Uuid>()
+            .map(|u| Channel::topic(TopicId(u)))
+            .unwrap_or(Channel::GENERAL),
+        _ => Channel::GENERAL,
+    }
+}
+
+/// Someone's profile picture as the engine put it on disk.
+fn picture_of(snap: &Snapshot, peer: PeerId) -> Option<String> {
+    snap.avatars.get(&peer).map(|p| p.display().to_string())
+}
+
+/// The three avatar fills from `DESIGN.md` are identity, not state: one hue per peer for
+/// the life of the install.
+///
+/// Assigned by position in the sorted set of known peers rather than by hashing the id.
+/// A hash is stable too, but it collides — two of three peers came out the same green on
+/// the first run — and two people wearing one colour defeats the point of the hue.
+/// Sorting is just as stable for a fixed group and is collision-free up to three.
+fn avatar_hues(me: PeerId, peers: &[PeerView]) -> HashMap<PeerId, u8> {
+    let mut ids: Vec<PeerId> = std::iter::once(me)
+        .chain(peers.iter().filter_map(|p| p.peer_id))
+        .collect();
+    ids.sort_unstable();
+    ids.dedup();
+    ids.into_iter()
+        .enumerate()
+        .map(|(i, id)| (id, (i % 3) as u8 + 1))
+        .collect()
+}
+
+/// One line of presence vocabulary, shared by the roster, the status bar and the peer
+/// table in settings. Deliberately not a colour: `offline` is drawn as an unlit ring.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Presence {
+    Online,
+    Offline,
+    /// Protocol or identity trouble. Rare, and the only peer state that is a real fault
+    /// rather than a normal absence.
+    Broken,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PeerState {
+    /// Empty for a peer whose identity we have not learned yet.
+    pub id: String,
+    pub name: String,
+    pub address: String,
+    pub avatar: u8,
+    /// Their profile picture on disk (`Snapshot::avatars`), drawn instead of the monogram.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub picture: Option<String>,
+    pub presence: Presence,
+    /// The status this peer chose for itself ("away", "busy"), while it is online. `None`
+    /// means it never sent one (or is offline): plain online, nothing extra to draw.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_status: Option<String>,
+    /// The game this peer has in front ("Elden Ring"), while it is online. Already cleaned
+    /// by the engine. It only moves when they switch games, so it may live here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity: Option<String>,
+    /// Set when `presence` is `broken`: what is wrong, in one sentence.
+    pub problem: Option<String>,
+    /// How the connection runs (phase B6): "direct · internet", "direct · LAN", "via
+    /// tailnet", or "not reachable" while offline. Moves only with a new connection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    pub app_version: Option<String>,
+    pub in_call: bool,
+    /// They muted or deafened themselves, as they reported it. Only while in the call; moves
+    /// only on a toggle. Deafened implies muted.
+    #[serde(default)]
+    pub muted: bool,
+    #[serde(default)]
+    pub deafened: bool,
+    pub volume: f32,
+    pub unread: usize,
+    /// When this peer was last seen online, in millis since epoch. Observed by this
+    /// process, not remembered across restarts — so it is `None` for a peer that has not
+    /// been up since this app started, and the roster then says plain "Offline" rather
+    /// than inventing a time.
+    pub last_seen: Option<i64>,
+    /// Does this peer share desktop audio we are listening to?
+    pub desktop_volume: Option<f32>,
+    pub desktop_stream: Option<u32>,
+    /// The Spotify this peer shares, whether or not we are in the call to hear it.
+    #[serde(default)]
+    pub music: Option<MusicState>,
+    /// The engine's place for this peer, for Remove. Not the position in `peers`.
+    #[serde(default)]
+    pub slot: usize,
+}
+
+/// A peer's shared Spotify: what plays, and its own volume while we listen.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MusicState {
+    pub stream: u32,
+    /// "Artist – Track", or "Spotify" while nothing is known.
+    pub title: String,
+    pub listening: bool,
+    pub volume: f32,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SelfState {
+    pub id: String,
+    pub name: String,
+    pub avatar: u8,
+    /// Their profile picture on disk (`Snapshot::avatars`), drawn instead of the monogram.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub picture: Option<String>,
+    /// Our own chosen status: "online", "away" or "busy".
+    pub status: String,
+    /// The game we have in front, for the "Stream <game>" button. Only moves on a switch.
+    #[serde(default)]
+    pub playing: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct VoiceState {
+    pub joined: bool,
+    pub muted: bool,
+    pub deafened: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ClipsState {
+    /// Recording is on.
+    pub enabled: bool,
+    /// How far back a clip reaches, in seconds.
+    pub window_sec: u32,
+    /// Which screen is being recorded (name from the source list).
+    pub monitor: Option<String>,
+    /// The configured global shortcut, as written in the config.
+    pub hotkey: String,
+    /// Where finished clips land; for the open-folder button.
+    pub folder: String,
+    /// The most recent clip, if any was saved this session.
+    pub last_clip: Option<String>,
+    /// Post a freshly saved clip in the chat on its own (only while in a call).
+    #[serde(default)]
+    pub auto_share: bool,
+    /// "Share last clip" can work: a clip exists, is still on disk and not offered yet.
+    #[serde(default)]
+    pub can_share: bool,
+    /// Last clip error that has not been replaced yet.
+    pub error: Option<String>,
+    /// Frame rate, resolution and quality names, as in `clips::CLIP_FPS` and friends.
+    #[serde(default = "crate::config::default_clip_fps")]
+    pub fps: u32,
+    #[serde(default = "crate::config::default_clip_resolutie")]
+    pub resolution: String,
+    #[serde(default = "crate::config::default_clip_kwaliteit")]
+    pub quality: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ChannelState {
+    pub key: String,
+    pub name: String,
+    pub unread: usize,
+    /// Only a sub-channel can be renamed or removed; the general channel cannot.
+    pub removable: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OwnStreamState {
+    pub stream_id: u32,
+    pub title: String,
+    pub viewers: usize,
+    pub is_audio: bool,
+    /// Our own camera rather than a screen: the camera button reads this for its pressed
+    /// state, and the share button and the "You share" lines count only screens.
+    pub is_camera: bool,
+    /// Our shared Spotify (also `is_audio`); the title is what plays now.
+    #[serde(default)]
+    pub is_music: bool,
+    /// Viewers may draw on this screen (decision 45). Only ever true for a screen.
+    #[serde(default)]
+    pub drawing: bool,
+    /// Something is drawn on it right now. Flips only at the first line and when the last
+    /// one goes, never per point; the lines themselves reach the tile via the thumbnails.
+    #[serde(default)]
+    pub has_drawing: bool,
+    /// Viewers may ask to control this screen (decision 54). Only ever true for a monitor.
+    #[serde(default)]
+    pub remote_control: bool,
+    /// A monitor on a platform that can be controlled: only then is there a switch for it.
+    #[serde(default)]
+    pub controllable: bool,
+    /// Someone asks to control it and waits for Allow or Deny.
+    #[serde(default)]
+    pub control_request: Option<ControlPeer>,
+    /// Someone controls it right now.
+    #[serde(default)]
+    pub controller: Option<ControlPeer>,
+}
+
+/// A peer in a remote control request or session: the id for the command, the name to show.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ControlPeer {
+    pub id: String,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StreamState {
+    pub owner: String,
+    pub owner_name: String,
+    pub stream_id: u32,
+    pub title: String,
+    pub width: u32,
+    pub height: u32,
+    pub watching: bool,
+    pub is_audio: bool,
+    /// Somebody's camera rather than their screen. Same window, same thumbnail — only the
+    /// icon in the list differs.
+    pub is_camera: bool,
+    pub volume: f32,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "lowercase")]
+pub enum TransferState {
+    /// Offered by someone else and not fetched yet.
+    Available,
+    Running {
+        received: u64,
+        total: u64,
+    },
+    Done,
+    Failed {
+        error: String,
+    },
+    /// Ours. There is nothing to download.
+    Mine,
+}
+
+/// One peer's score on one Wordle day, as the card in the log draws it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WordleScore {
+    pub peer: String,
+    pub name: String,
+    pub avatar: u8,
+    pub mine: bool,
+    /// Guesses used, 1 to 6, whether or not the word was found.
+    pub guesses: u8,
+    pub solved: bool,
+    /// The squares, five characters per row: `0` miss, `1` near, `2` hit. Empty if the
+    /// peer runs a build that did not send one.
+    pub pattern: String,
+    /// How long the game took, first guess to last, in whole seconds. `None` for a result
+    /// from before the clock existed, or from a peer that does not send one — the window
+    /// then draws no time. Equal guesses are broken by this; see `crate::wordle::winnaars`.
+    pub seconds: Option<u32>,
+    /// Took the point for this day. More than one means a draw, and then they all did.
+    pub won: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum TimelineItem {
+    Message {
+        id: OpRef,
+        author: String,
+        author_name: String,
+        avatar: u8,
+        body: String,
+        at: i64,
+        edited: bool,
+        mine: bool,
+        mentions_you: bool,
+        /// The message this one answers, when it was sent as a reply. The frontend draws
+        /// a clickable quote above the body.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reply_to: Option<OpRef>,
+        /// Author and opening text of that parent, resolved on this side. `None` also
+        /// covers a parent that is deleted or not (yet) in our log — the frontend then
+        /// shows "original unavailable" instead of guessing.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reply_snippet: Option<ReplySnippet>,
+        /// Reactions grouped per emoji, in the same order every peer folds them to.
+        reactions: Vec<ReactionState>,
+    },
+    File {
+        id: OpRef,
+        author: String,
+        author_name: String,
+        avatar: u8,
+        name: String,
+        size: u64,
+        at: i64,
+        mine: bool,
+        transfer: TransferState,
+        /// Absolute path in the content-addressed picture folder, for an image whose
+        /// bytes are actually on this machine and that fits [`MAX_INLINE_SIDE`]. The
+        /// timeline draws it from disk. `None` covers "not an image", "not downloaded yet"
+        /// and "too large to draw", and the card falls back to the generic form.
+        image_path: Option<String>,
+        /// Where the bytes are on this machine — our own offer, or a finished download.
+        /// `Some` is what turns the download button into an open button, so it is also
+        /// the answer to "may this be opened at all": the frontend never gets to name a
+        /// path, it hands back the `OpRef` and `open_file` looks it up here again.
+        ///
+        /// For an image this is the same path as `image_path`; for everything else it is
+        /// the file in the download folder under whatever name it actually got.
+        local_path: Option<String>,
+        /// Whether opening this one shows the folder instead of the file, because the
+        /// system would execute it. The button says so rather than promising "Open" and
+        /// doing something else; the decision itself is made again in `open_file`, from
+        /// the same `files::opent_als_code`.
+        opens_folder: bool,
+    },
+    /// "Clip saved" with a Share button, in #general on the machine that made the clip and
+    /// nowhere else (decision 44). Not an op and never on the wire, like the Wordle card;
+    /// only the last clip has one, and it is gone after a restart.
+    Clip {
+        /// When the clip finished, in ms like a message's `at`.
+        at: i64,
+        /// Bytes on disk when it finished.
+        size: u64,
+        /// Already offered in the chat: the card says so and drops the button.
+        shared: bool,
+    },
+    /// The puzzle of the day, which shows up in #general at 07:00 (2026-08-20).
+    ///
+    /// Not an op and never on the wire: every peer can work out on its own that today is
+    /// today, so a card carries no information anybody has to be told. Three peers each
+    /// posting a "here is today's puzzle" message would be three cards, and the oplog has
+    /// no way to make them one — `seq` is per author. What *does* travel is the results.
+    Wordle {
+        /// The puzzle's date as `YYYYMMDD`. The key everything else is grouped by.
+        day: u32,
+        /// 07:00 local on that day: where the card sits between the messages, and the
+        /// time the log prints next to it.
+        at: i64,
+        /// The number the real Wordle prints above it. Only known for a day this machine
+        /// fetched itself.
+        number: Option<u32>,
+        /// What the button does: `play`, `continue`, `done`, `waiting` (the word has not
+        /// arrived), or `past` (an older day, which cannot be played any more).
+        action: String,
+        /// Guesses used on an unfinished game of today.
+        progress: u8,
+        /// Everyone who played, best score first.
+        results: Vec<WordleScore>,
+        /// Did this day count for points? False while only one peer has played — you get
+        /// no point for playing alone. See `crate::wordle::winnaars`.
+        scored: bool,
+    },
+}
+
+/// An `OpId` in a shape the view can hand straight back to a command.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct OpRef {
+    pub author: String,
+    pub channel: String,
+    pub seq: u64,
+}
+
+/// The quote above a reply: who wrote the parent and how it opens. Built here so the
+/// frontend never has to look an `OpRef` up in the log itself.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReplySnippet {
+    pub author_name: String,
+    /// The parent's body, cut off at roughly one line.
+    pub body: String,
+}
+
+/// One reaction pill under a message.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReactionState {
+    pub emoji: String,
+    pub count: usize,
+    /// Peer UUIDs, in the store's own order; the frontend resolves names for a tooltip.
+    pub peers: Vec<String>,
+    /// Did I react too? Decides whether clicking removes or adds.
+    pub mine: bool,
+}
+
+impl OpRef {
+    fn of(id: OpId) -> Self {
+        Self {
+            author: id.author.to_string(),
+            channel: channel_key(id.channel),
+            seq: id.seq,
+        }
+    }
+
+    pub fn to_op_id(&self) -> Option<OpId> {
+        Some(OpId::new(
+            PeerId(self.author.parse().ok()?),
+            parse_channel(&self.channel),
+            self.seq,
+        ))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "lowercase")]
+pub enum UpdateState {
+    /// A check the user asked for is running. An automatic one never reaches the window.
+    Checking,
+    Downloading {
+        version: String,
+        received: u64,
+        total: u64,
+    },
+    Ready {
+        version: String,
+    },
+    /// Asked, answered: the feed had nothing newer.
+    #[serde(rename = "uptodate")]
+    UpToDate,
+    Failed {
+        error: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct VideoSettings {
+    pub codec: String,
+    pub fps: u32,
+    pub bitrate: u32,
+}
+
+/// Which set of notification tones is picked, and how loud.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SoundSettings {
+    /// The set that will actually be heard, which is not always the one in `config.toml`.
+    ///
+    /// A config written by a newer build may name a set this build does not have; the config
+    /// keeps that name on purpose, so downgrading once does not erase the choice (see
+    /// `config::SoundConfig::herstel`). The window has to show what is true rather than what
+    /// is stored, otherwise the picker highlights nothing at all — so the fallback is
+    /// resolved here, in the view, where showing reality is the whole job.
+    pub set: String,
+    /// 0.0 to 1.0. The slider shows whole percents.
+    pub volume: f32,
+}
+
+/// The in-game overlay: on or off, and whether this platform has one.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OverlayState {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Also outside a game; otherwise only while `me.playing` is set.
+    #[serde(default)]
+    pub always: bool,
+    /// False on macOS, which has no overlay: the tab says so instead of a dead switch.
+    #[serde(default = "overlay_available")]
+    pub available: bool,
+}
+
+/// A fixture `state.json` without the field draws the switch where the platform has one.
+impl Default for OverlayState {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            always: false,
+            available: overlay_available(),
+        }
+    }
+}
+
+fn overlay_available() -> bool {
+    cfg!(windows)
+}
+
+fn remote_control_available() -> bool {
+    cfg!(windows)
+}
+
+/// How the microphone gate is operated: voice activity alone, or with a key.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PushToTalkState {
+    /// `voice`, `talk` or `mute`, as in `config.toml`.
+    pub mode: String,
+    /// The key's config name (`RightCtrl`, `Mouse4`, ...). The labels live in
+    /// `fitcom_audio::spreektoets::TOETSEN`.
+    pub key: String,
+    /// False where the platform cannot read a global key (macOS): the tab says so and the
+    /// engine keeps to voice activity.
+    pub available: bool,
+}
+
+impl Default for PushToTalkState {
+    fn default() -> Self {
+        let c = crate::config::PushToTalkConfig::default();
+        PushToTalkState {
+            mode: c.mode,
+            key: c.key,
+            available: fitcom_audio::spreektoets::BESCHIKBAAR,
+        }
+    }
+}
+
+/// One choosable set of tones. Comes from the engine rather than being spelled out in the
+/// frontend, so adding a set is one place instead of two.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SoundSetInfo {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+}
+
+/// One event that can be auditioned, so all six can be judged instead of only the one the
+/// preview button happens to play.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SoundEventInfo {
+    pub id: String,
+    pub name: String,
+}
+
+/// One row of the board: the word and its five colours.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WordleRow {
+    pub word: String,
+    /// `0` miss, `1` near, `2` hit — one per letter.
+    pub marks: Vec<u8>,
+}
+
+/// Today's board, as the dialog draws it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WordleBoard {
+    pub number: u32,
+    pub rows: Vec<WordleRow>,
+    pub done: bool,
+    pub won: bool,
+    /// Only once the game is over. While it runs, the answer stays in the engine — see
+    /// `crate::wordle`.
+    pub solution: Option<String>,
+    /// How long the finished game took, in whole seconds. Nothing ticks here while you
+    /// play; it appears when the game is over. `None` for a game from before the clock.
+    pub seconds: Option<u32>,
+}
+
+/// One line of the leaderboard.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WordleStanding {
+    pub peer: String,
+    pub name: String,
+    pub avatar: u8,
+    pub mine: bool,
+    /// Days won, or drawn on the lowest number of guesses.
+    pub points: u32,
+    pub played: u32,
+    pub solved: u32,
+}
+
+/// The game of the day and the leaderboard over all days.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WordleState {
+    /// Today's puzzle date as `YYYYMMDD`. Rolls over at 07:00, not at midnight.
+    pub day: u32,
+    /// `None` while today's word has not been fetched — then there is no card either.
+    pub board: Option<WordleBoard>,
+    /// Why the last guess was not accepted.
+    pub error: Option<String>,
+    /// Highest points first. Only peers who ever played show up.
+    pub standings: Vec<WordleStanding>,
+    /// How many guesses a game allows, so the frontend does not carry its own copy.
+    pub tries: u8,
+}
+
+/// One person's week, for the Recap panel.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RecapRow {
+    pub peer: String,
+    pub name: String,
+    pub avatar: u8,
+    /// Their profile picture on disk (`Snapshot::avatars`), drawn instead of the monogram.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub picture: Option<String>,
+    pub mine: bool,
+    /// Seconds in the call, as this machine saw it. Someone who talked while we were
+    /// offline is not counted — see `crate::gebruik` for why that is the honest number.
+    pub voice_sec: u64,
+    /// Seconds with a screen, window or camera shared. Desktop audio is not counted: it
+    /// rides along with a screen and would double every share.
+    pub shared_sec: u64,
+    pub messages: u32,
+    pub files: u32,
+    pub wordle_points: u32,
+    pub wordle_played: u32,
+    pub wordle_solved: u32,
+}
+
+/// The last seven days, fetched with `get_recap` when the panel opens.
+///
+/// Not part of `UiState`: every figure in here moves while a call is running, and a state
+/// event fires on any change to that struct. Same reasoning as the timeline.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Recap {
+    /// Length of the window in days.
+    pub days: u32,
+    /// First day in the window, `YYYYMMDD`.
+    pub from: u32,
+    /// Busiest first. Only people who did something show up.
+    pub rows: Vec<RecapRow>,
+}
+
+/// Everything the window needs to draw itself, minus the timeline.
+///
+/// The timeline is fetched per conversation with `get_timeline` instead of riding along
+/// here. It is the only unbounded part of the state, and pushing a whole history through
+/// the IPC bridge on every tick would undo the reason for moving off immediate mode.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UiState {
+    #[serde(rename = "self")]
+    pub me: SelfState,
+    pub peers: Vec<PeerState>,
+    pub voice: VoiceState,
+    pub channels: Vec<ChannelState>,
+    pub own_streams: Vec<OwnStreamState>,
+    pub streams: Vec<StreamState>,
+    pub video: VideoSettings,
+    pub sound: SoundSettings,
+    #[serde(default)]
+    pub push_to_talk: PushToTalkState,
+    /// Whether the game in front is shared as "Playing X". Comes from `config.toml`.
+    #[serde(default)]
+    pub share_activity: bool,
+    /// Whether viewers may draw on a screen you start sharing: the default in the picker.
+    /// Comes from `config.toml`.
+    #[serde(default)]
+    pub allow_drawing: bool,
+    /// The same for remote control of a monitor (decision 54). Off by default.
+    #[serde(default)]
+    pub allow_remote_control: bool,
+    /// False on macOS, where a screen cannot be controlled: the switches are not drawn.
+    #[serde(default = "remote_control_available")]
+    pub remote_control_available: bool,
+    /// Open someone's new screen share by itself on a second monitor. Comes from
+    /// `config.toml`; Windows only, like remote control.
+    #[serde(default)]
+    pub auto_popout: bool,
+    /// The monitor it opens on, by name from the screen list. `None`: another screen than the
+    /// one in front.
+    #[serde(default)]
+    pub popout_monitor: Option<String>,
+    /// The in-game overlay of who is in the call (decision 53). Comes from `config.toml`.
+    #[serde(default)]
+    pub overlay: OverlayState,
+    /// Constant for the life of the process; rides along so the Settings panel does not
+    /// need a second call to draw the picker.
+    pub sound_sets: Vec<SoundSetInfo>,
+    pub sound_events: Vec<SoundEventInfo>,
+    pub input_device: Option<String>,
+    pub output_device: Option<String>,
+    pub do_not_disturb: bool,
+    /// Clip recording (fase 15). `None` where the platform has none — the UI hides
+    /// everything clips-related then.
+    pub clips: Option<ClipsState>,
+    /// Who is typing where, keyed by conversation key ("general", "topic:<uuid>",
+    /// "dm:<peer-uuid>") with the peer UUIDs. Vluchtig — rides along in `state`, which is
+    /// fine: a typing event changes at most a few times a minute, and only while someone
+    /// actually types.
+    pub typing: HashMap<String, Vec<String>>,
+    pub update: Option<UpdateState>,
+    pub wordle: WordleState,
+    pub error: Option<String>,
+    pub app_version: String,
+    pub protocol_version: u32,
+    pub control_port: u16,
+    pub media_port: u16,
+    /// The line about the router and the outside address (A0), once it is measured. Changes
+    /// once, a few seconds after start.
+    #[serde(default)]
+    pub router: Option<String>,
+    /// This installation's invite code (phase B1). Changes only with its own addresses or
+    /// name.
+    #[serde(default)]
+    pub invite_code: String,
+    /// What the last paste of invite codes did, in one or two sentences.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code_result: Option<String>,
+    pub download_dir: String,
+    pub pictures_dir: String,
+    pub autostart: bool,
+    pub minimize_to_tray: bool,
+    /// Changes whenever the op log did. The frontend refetches the open conversation
+    /// when it moves, so a message that arrives while you are reading shows up without
+    /// the whole history travelling on every tick.
+    pub timeline_revision: u64,
+}
+
+/// The constant half of the state: what the config and the build say, not what the
+/// engine is currently doing.
+pub struct Constants {
+    pub me: PeerId,
+    pub fallback_name: String,
+    /// The choosable tone sets and the events that can be auditioned. Built once from
+    /// `crate::geluid`, because the frontend must not carry a second copy of that list.
+    pub sound_sets: Vec<SoundSetInfo>,
+    pub sound_events: Vec<SoundEventInfo>,
+    pub control_port: u16,
+    pub media_port: u16,
+    pub autostart: bool,
+    pub minimize_to_tray: bool,
+}
+
+fn reply_snippet(body: &str) -> String {
+    body.chars().take(REPLY_SNIPPET_LEN).collect()
+}
+
+fn display_name(snap: &Snapshot, peer: PeerId, fallback: &str) -> String {
+    snap.timeline
+        .nicknames
+        .get(&peer)
+        .cloned()
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| fallback.to_string())
+}
+
+/// "Router: PCP yes · NAT-PMP yes · UPnP no · public IPv4 · no IPv6" (A0 of
+/// `docs/PLAN-ZONDER-TAILSCALE.md`). The friends send a screenshot of this line. Words and not
+/// check marks: neither embedded font has a glyph for them.
+fn router_line(b: &fitcom_net::bereik::Bereik) -> String {
+    use fitcom_net::bereik::Soort;
+    if !b.gateway {
+        return "Router: not found (offline, or a VPN exit node?)".to_string();
+    }
+    let yes = |on: bool| if on { "yes" } else { "no" };
+    let outside = match b.soort() {
+        Soort::Publiek => "public IPv4",
+        Soort::Cgnat => "CGNAT",
+        Soort::Onbekend => "outside address unknown",
+    };
+    let mapped = b
+        .gemapt
+        .map(|a| format!(" \u{b7} open at {a}"))
+        .unwrap_or_default();
+    format!(
+        "Router: PCP {} \u{b7} NAT-PMP {} \u{b7} UPnP {} \u{b7} {outside} \u{b7} {}{mapped}",
+        yes(b.pcp),
+        yes(b.nat_pmp),
+        yes(b.upnp),
+        if b.ipv6 { "IPv6" } else { "no IPv6" }
+    )
+}
+
+/// One line about the last paste of invite codes.
+fn code_result_line(u: &crate::codes::CodesUitslag) -> String {
+    use crate::codes::CodeWeigering;
+    use fitcom_proto::uitnodiging::CodeFout;
+    if u.geen_code {
+        return "No invite code in that text. A code starts with fitcom1:".into();
+    }
+    let names = |v: &[String]| {
+        v.iter()
+            .map(|n| if n.is_empty() { "a peer" } else { n.as_str() })
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let mut parts = Vec::new();
+    if !u.toegevoegd.is_empty() {
+        parts.push(format!("Added {}.", names(&u.toegevoegd)));
+    }
+    if !u.bijgewerkt.is_empty() {
+        parts.push(format!("Updated {}.", names(&u.bijgewerkt)));
+    }
+    for (name, why) in &u.geweigerd {
+        let who = if name.is_empty() {
+            "A code"
+        } else {
+            name.as_str()
+        };
+        let why = match why {
+            CodeWeigering::Onleesbaar(CodeFout::Controlesom) => {
+                "is cut off or mistyped. Copy it again, whole."
+            }
+            CodeWeigering::Onleesbaar(CodeFout::Versie(_)) => {
+                "comes from a newer version of the app. Update first."
+            }
+            CodeWeigering::Onleesbaar(_) => "is damaged. Copy it again, whole.",
+            CodeWeigering::EigenCode => "is your own code.",
+            CodeWeigering::SleutelWijkt => {
+                "has a different key than the one pinned for this peer. If they reinstalled, \
+                 remove their known_id and public_key from config.toml first."
+            }
+            CodeWeigering::Bezet => "could not be added just now. Paste it again.",
+        };
+        parts.push(format!("{who} {why}"));
+    }
+    parts.join(" ")
+}
+
+/// The path of a connection, from its source address (phase B6).
+fn path_word(status: &PeerStatus) -> &'static str {
+    let PeerStatus::Online { remote, .. } = status else {
+        return "not reachable";
+    };
+    let ip = remote.ip().to_canonical();
+    let lan = match ip {
+        std::net::IpAddr::V4(v4) => v4.is_private() || v4.is_link_local() || v4.is_loopback(),
+        std::net::IpAddr::V6(v6) => {
+            v6.is_loopback() || v6.is_unicast_link_local() || v6.is_unique_local()
+        }
+    };
+    if fitcom_net::mag_leren(ip) && !ip.is_loopback() {
+        "via tailnet"
+    } else if lan {
+        "direct \u{b7} LAN"
+    } else {
+        "direct \u{b7} internet"
+    }
+}
+
+/// RTT is deliberately not here: it moves every tick and lives in the `meters` event, so
+/// a measurement ticking over cannot force a full state push. See `ui/mod.rs`.
+fn peer_presence(view: &PeerView) -> (Presence, Option<String>, Option<String>) {
+    match &view.status {
+        PeerStatus::Online { app_version, .. } => {
+            (Presence::Online, None, Some(app_version.clone()))
+        }
+        // The mesh redials an absent peer every few seconds and says `Connecting` for each
+        // attempt. For the window that is still just offline: showing it made an absent
+        // friend look like a fault, and flipped the state push on every retry.
+        PeerStatus::Connecting | PeerStatus::Offline { .. } => (Presence::Offline, None, None),
+        PeerStatus::VersionMismatch { theirs: 0, ours } => (
+            Presence::Broken,
+            Some(format!(
+                "Runs an older protocol, this build speaks {ours}. One of you has to update."
+            )),
+            None,
+        ),
+        PeerStatus::VersionMismatch { theirs, ours } => (
+            Presence::Broken,
+            Some(format!(
+                "Runs protocol {theirs}, this build speaks {ours}. One of you has to update."
+            )),
+            None,
+        ),
+        PeerStatus::IdentityChanged { .. } => (
+            Presence::Broken,
+            Some("A different identity answered at this address.".into()),
+            None,
+        ),
+        PeerStatus::UnknownKey => (
+            Presence::Broken,
+            Some(
+                "No key known for this peer. Paste their invite code; keys are only learned \
+                 by themselves over the tailnet."
+                    .into(),
+            ),
+            None,
+        ),
+    }
+}
+
+impl UiState {
+    pub fn build(
+        snap: &Snapshot,
+        c: &Constants,
+        timeline_revision: u64,
+        last_seen: &HashMap<PeerId, i64>,
+    ) -> Self {
+        let my_name = display_name(snap, c.me, &c.fallback_name);
+        let hues = avatar_hues(c.me, &snap.peers);
+
+        // Desktop audio rides along as its own stream. It belongs to the peer's row in
+        // the member list, not in the strip, so it is folded into the peer here.
+        let desktop = |owner: PeerId| {
+            snap.streams
+                .iter()
+                .find(|s| s.eigenaar == owner && s.is_geluid && !s.is_muziek && s.kijken)
+                .map(|s| (s.stream_id, s.volume))
+        };
+        // Spotify likewise, but shown even when we are not listening: "X plays ..." is
+        // a reason to join the call.
+        let music = |owner: PeerId| {
+            snap.streams
+                .iter()
+                .find(|s| s.eigenaar == owner && s.is_muziek)
+                .map(|s| MusicState {
+                    stream: s.stream_id,
+                    title: s.titel.clone(),
+                    listening: s.kijken,
+                    volume: s.volume,
+                })
+        };
+
+        let peers = snap
+            .peers
+            .iter()
+            .map(|p| {
+                let (presence, problem, app_version) = peer_presence(p);
+                let id = p.peer_id;
+                let desk = id.and_then(desktop);
+                PeerState {
+                    id: id.map(|p| p.to_string()).unwrap_or_default(),
+                    name: match id {
+                        Some(peer) => display_name(snap, peer, &p.label),
+                        None => p.label.clone(),
+                    },
+                    address: p.address.clone(),
+                    avatar: id.and_then(|i| hues.get(&i).copied()).unwrap_or(3),
+                    picture: id.and_then(|i| picture_of(snap, i)),
+                    presence,
+                    user_status: p
+                        .user_status
+                        .filter(|_| presence == Presence::Online)
+                        .map(|s| s.to_string()),
+                    activity: p
+                        .activiteit
+                        .clone()
+                        .filter(|_| presence == Presence::Online),
+                    problem,
+                    path: Some(path_word(&p.status).to_string()),
+                    app_version,
+                    in_call: p.in_voice,
+                    muted: p.muted,
+                    deafened: p.deafened,
+                    volume: p.volume,
+                    unread: id
+                        .and_then(|peer| snap.ongelezen_dm.get(&peer).copied())
+                        .unwrap_or(0),
+                    // Only while they are away. Carrying it for an online peer would
+                    // move on every tick and turn every tick into a state event — the
+                    // one thing the change-detection in `ui/mod.rs` exists to avoid.
+                    last_seen: (presence != Presence::Online)
+                        .then(|| id.and_then(|i| last_seen.get(&i).copied()))
+                        .flatten(),
+                    desktop_volume: desk.map(|d| d.1),
+                    desktop_stream: desk.map(|d| d.0),
+                    music: id.and_then(music),
+                    slot: p.plek,
+                }
+            })
+            .collect();
+
+        let mut channels = vec![ChannelState {
+            key: "general".into(),
+            name: "general".into(),
+            unread: snap.ongelezen,
+            removable: false,
+        }];
+        let mut topics: Vec<(&TopicId, &String)> = snap.timeline.topics.iter().collect();
+        topics.sort_by_key(|(_, title)| title.to_lowercase());
+        channels.extend(topics.into_iter().map(|(id, title)| ChannelState {
+            key: channel_key(Channel::topic(*id)),
+            name: title.clone(),
+            unread: snap.ongelezen_topic.get(id).copied().unwrap_or(0),
+            removable: true,
+        }));
+
+        let name_of = |peer: PeerId| display_name(snap, peer, &peer.to_string()[..8]);
+
+        Self {
+            me: SelfState {
+                id: c.me.to_string(),
+                name: my_name,
+                avatar: hues.get(&c.me).copied().unwrap_or(1),
+                picture: picture_of(snap, c.me),
+                status: snap.eigen_status.to_string(),
+                playing: snap.eigen_spel.clone(),
+            },
+            peers,
+            voice: VoiceState {
+                joined: snap.voice.actief,
+                muted: snap.voice.muted,
+                deafened: snap.voice.deafened,
+            },
+            typing: {
+                let mut map: HashMap<String, Vec<String>> = HashMap::new();
+                for (channel, peer) in &snap.typing {
+                    map.entry(channel_key(*channel))
+                        .or_default()
+                        .push(peer.to_string());
+                }
+                map
+            },
+            channels,
+            own_streams: snap
+                .eigen_streams
+                .iter()
+                .map(|s| OwnStreamState {
+                    stream_id: s.stream_id,
+                    title: s.titel.clone(),
+                    viewers: s.kijkers,
+                    is_audio: s.is_geluid,
+                    is_camera: s.is_camera,
+                    is_music: s.is_muziek,
+                    drawing: s.tekening.aan,
+                    has_drawing: !s.tekening.is_leeg(),
+                    remote_control: s.bedienen,
+                    controllable: s.kan_bedienen,
+                    control_request: s.vrager.map(|p| ControlPeer {
+                        id: p.to_string(),
+                        name: name_of(p),
+                    }),
+                    controller: s.bediener.map(|p| ControlPeer {
+                        id: p.to_string(),
+                        name: name_of(p),
+                    }),
+                })
+                .collect(),
+            streams: snap
+                .streams
+                .iter()
+                .filter(|s| !s.is_geluid)
+                .map(|s| StreamState {
+                    owner: s.eigenaar.to_string(),
+                    owner_name: name_of(s.eigenaar),
+                    stream_id: s.stream_id,
+                    title: s.titel.clone(),
+                    width: s.breedte,
+                    height: s.hoogte,
+                    watching: s.kijken,
+                    is_audio: false,
+                    is_camera: s.is_camera,
+                    volume: s.volume,
+                })
+                .collect(),
+            video: VideoSettings {
+                codec: snap.video.codec.clone(),
+                fps: snap.video.fps,
+                bitrate: snap.video.bitrate,
+            },
+            sound: SoundSettings {
+                set: crate::geluid::Geluidset::van_naam(&snap.geluid.set)
+                    .unwrap_or(crate::geluid::Geluidset::STANDAARD)
+                    .naam()
+                    .to_string(),
+                volume: snap.geluid.volume,
+            },
+            push_to_talk: PushToTalkState {
+                mode: snap.push_to_talk.mode.clone(),
+                key: snap.push_to_talk.key.clone(),
+                available: fitcom_audio::spreektoets::BESCHIKBAAR,
+            },
+            share_activity: snap.deel_activiteit,
+            allow_drawing: snap.tekenen,
+            allow_remote_control: snap.bedienen,
+            remote_control_available: remote_control_available(),
+            auto_popout: snap.auto_popout,
+            popout_monitor: snap.popout_monitor.clone(),
+            overlay: OverlayState {
+                enabled: snap.overlay.enabled,
+                always: snap.overlay.always,
+                available: overlay_available(),
+            },
+            sound_sets: c.sound_sets.clone(),
+            sound_events: c.sound_events.clone(),
+            input_device: snap.input_device.clone(),
+            output_device: snap.output_device.clone(),
+            do_not_disturb: snap.niet_storen,
+            clips: snap.clips.as_ref().map(|c| ClipsState {
+                enabled: c.aan,
+                window_sec: c.venster_sec,
+                monitor: c.monitor.clone(),
+                hotkey: c.hotkey.clone(),
+                folder: c.map.clone(),
+                last_clip: c.laatste.clone(),
+                auto_share: c.auto_delen,
+                can_share: c.kan_delen,
+                error: c.fout.clone(),
+                fps: c.fps,
+                resolution: c.resolutie.clone(),
+                quality: c.kwaliteit.clone(),
+            }),
+            wordle: wordle_state(snap, c.me, &hues),
+            update: snap.update.as_ref().map(|u| match u {
+                UpdateStatus::Zoeken => UpdateState::Checking,
+                UpdateStatus::Actueel => UpdateState::UpToDate,
+                UpdateStatus::Bezig {
+                    versie,
+                    ontvangen,
+                    totaal,
+                } => UpdateState::Downloading {
+                    version: versie.clone(),
+                    received: *ontvangen,
+                    total: *totaal,
+                },
+                UpdateStatus::KlaarOmToeTePassen { versie, .. } => UpdateState::Ready {
+                    version: versie.clone(),
+                },
+                UpdateStatus::Mislukt(e) => UpdateState::Failed { error: e.clone() },
+            }),
+            error: snap.fout.clone(),
+            app_version: env!("CARGO_PKG_VERSION").to_string(),
+            protocol_version: fitcom_proto::PROTOCOL_VERSION,
+            control_port: c.control_port,
+            media_port: c.media_port,
+            router: snap.bereik.as_ref().map(router_line),
+            invite_code: snap.uitnodiging.clone(),
+            code_result: snap.codes_uitslag.as_ref().map(code_result_line),
+            download_dir: snap.download_dir.display().to_string(),
+            pictures_dir: snap.pictures_dir.display().to_string(),
+            autostart: c.autostart,
+            minimize_to_tray: c.minimize_to_tray,
+            timeline_revision,
+        }
+    }
+}
+
+/// The recap the engine last computed, with names and avatars filled in.
+///
+/// Nothing is recalculated here — the engine owns the numbers, this only dresses them for
+/// the window. That keeps the one place where the week is counted in the engine, next to
+/// the measurement itself.
+pub fn recap_of(snap: &Snapshot, me: PeerId) -> Recap {
+    let hues = avatar_hues(me, &snap.peers);
+    let o = &snap.overzicht;
+    Recap {
+        days: o.dagen,
+        from: o.vanaf,
+        rows: o
+            .regels
+            .iter()
+            .map(|r| RecapRow {
+                peer: r.peer.to_string(),
+                name: display_name(snap, r.peer, &r.peer.to_string()[..8]),
+                avatar: hues.get(&r.peer).copied().unwrap_or(3),
+                picture: picture_of(snap, r.peer),
+                mine: r.peer == me,
+                voice_sec: r.voice_ms / 1000,
+                shared_sec: r.deel_ms / 1000,
+                messages: r.berichten,
+                files: r.bestanden,
+                wordle_points: r.punten,
+                wordle_played: r.gespeeld,
+                wordle_solved: r.opgelost,
+            })
+            .collect(),
+    }
+}
+
+/// The longest side a picture may have to be drawn in the window. The webview decoded a
+/// peer's picture in its own renderer process; GPUI decodes it in ours and uploads it as
+/// one GPU texture (16384 is the D3D11/Metal ceiling), so a picture past this is shown as
+/// a plain file card instead of taking the app down.
+const MAX_INLINE_SIDE: u32 = 8192;
+/// Bound both the input GPUI reads and the RGBA texture it creates. A side limit alone
+/// still allows an 8192-square image to consume 256 MiB before decoder scratch space.
+const MAX_INLINE_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_INLINE_PIXELS: u64 = 16 * 1024 * 1024;
+
+/// Inspect the actual format before handing untrusted bytes to GPUI. GPUI retains every
+/// GIF frame without an aggregate allocation limit, so GIFs remain ordinary file cards.
+/// Checking the extension is insufficient: a GIF renamed to .png still takes that path.
+/// PNG (including APNG), JPEG and BMP use GPUI's single-frame decoder.
+fn drawable_inline(path: &Path) -> bool {
+    let Ok(file) = std::fs::File::open(path) else {
+        return false;
+    };
+    if !file
+        .metadata()
+        .is_ok_and(|m| m.is_file() && m.len() <= MAX_INLINE_BYTES)
+    {
+        return false;
+    }
+    let Ok(reader) = image::ImageReader::new(std::io::BufReader::new(file)).with_guessed_format()
+    else {
+        return false;
+    };
+    if !matches!(
+        reader.format(),
+        Some(image::ImageFormat::Png | image::ImageFormat::Jpeg | image::ImageFormat::Bmp)
+    ) {
+        return false;
+    }
+    reader.into_dimensions().is_ok_and(|(w, h)| {
+        w > 0
+            && h > 0
+            && w <= MAX_INLINE_SIDE
+            && h <= MAX_INLINE_SIDE
+            && u64::from(w) * u64::from(h) <= MAX_INLINE_PIXELS
+    })
+}
+
+/// Messages and files of one conversation, merged into the single chronological order
+/// the timeline draws. `lamport` is the sort key both carry for exactly this reason —
+/// wall clocks differ per machine and would order the thread differently per peer.
+pub fn timeline_of(
+    snap: &Snapshot,
+    channel: Channel,
+    me: PeerId,
+    my_name: &str,
+) -> Vec<TimelineItem> {
+    let name_of = |peer: PeerId| display_name(snap, peer, &peer.to_string()[..8]);
+    let hues = avatar_hues(me, &snap.peers);
+    let hue = |peer: PeerId| hues.get(&peer).copied().unwrap_or(3);
+
+    // The wall clock rides along so the Wordle cards can be slotted in by time — see the
+    // merge at the bottom. Ordering between messages and files stays `(lamport, author)`.
+    let mut items: Vec<(u64, PeerId, i64, TimelineItem)> = Vec::new();
+
+    // Parent lookup for reply quotes: only messages of this conversation can be parents
+    // (the fold nulls cross-channel references), so one pass over them is enough.
+    let parents: HashMap<OpId, (&fitcom_store::Message, String)> = snap
+        .timeline
+        .messages
+        .iter()
+        .filter(|m| belongs_to_channel(channel, me, m.channel, m.author))
+        // In characters, not bytes: `String::truncate` panics inside an é or an emoji, and
+        // this runs over every message of the conversation, a peer's included. One such
+        // message in the synced log crashed every peer on every start.
+        .map(|m| (m.id, (m, reply_snippet(&m.body))))
+        .collect();
+
+    // Reactions per message id, in the store's own order — already sorted the same way
+    // on every peer.
+    let reactions_of = |id: OpId| -> Vec<ReactionState> {
+        snap.timeline
+            .reactions
+            .iter()
+            .filter(|r| r.target == id)
+            .map(|r| ReactionState {
+                emoji: r.emoji.clone(),
+                count: r.peers.len(),
+                peers: r.peers.iter().map(|p| p.to_string()).collect(),
+                mine: r.peers.contains(&me),
+            })
+            .collect()
+    };
+
+    for m in &snap.timeline.messages {
+        if !belongs_to_channel(channel, me, m.channel, m.author) {
+            continue;
+        }
+        // A parent that is deleted or not yet known still travels as a reference; the
+        // frontend shows "original unavailable" when there is no snippet.
+        let snippet = m.reply_to.and_then(|p| {
+            parents.get(&p).map(|(parent, body)| ReplySnippet {
+                author_name: name_of(parent.author),
+                body: body.clone(),
+            })
+        });
+        items.push((
+            m.lamport,
+            m.author,
+            m.created_at,
+            TimelineItem::Message {
+                id: OpRef::of(m.id),
+                author: m.author.to_string(),
+                author_name: name_of(m.author),
+                avatar: hue(m.author),
+                body: m.body.clone(),
+                at: m.created_at,
+                edited: m.edited,
+                mine: m.author == me,
+                mentions_you: m.author != me && tags::bevat_tag(&m.body, my_name),
+                reply_to: m.reply_to.map(OpRef::of),
+                reply_snippet: snippet,
+                reactions: reactions_of(m.id),
+            },
+        ));
+    }
+
+    for f in &snap.files {
+        if !belongs_to_channel(channel, me, f.channel, f.author) {
+            continue;
+        }
+        let picture = files::is_afbeelding(&f.name)
+            .then(|| {
+                snap.pictures_dir
+                    .join(files::hash_bestandsnaam(&f.hash, &f.name))
+            })
+            .filter(|p| p.exists());
+        // An image resolves through the content-addressed path even when the engine has
+        // no record of it — that path is derived, not remembered, so it survives a
+        // restart on its own. Everything else leans on `FileView::local_path`.
+        let local_path = picture
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .or_else(|| {
+                f.local_path
+                    .as_deref()
+                    .filter(|p| p.exists())
+                    .map(|p| p.display().to_string())
+            });
+        let image_path = picture
+            .filter(|p| drawable_inline(p))
+            .map(|p| p.display().to_string());
+
+        items.push((
+            f.lamport,
+            f.author,
+            0,
+            TimelineItem::File {
+                id: OpRef::of(f.id),
+                author: f.author.to_string(),
+                author_name: name_of(f.author),
+                avatar: hue(f.author),
+                name: f.name.clone(),
+                size: f.size,
+                // Files carry no wall clock of their own; the timeline groups them with
+                // the message they were dropped next to, which is what `lamport` orders.
+                at: 0,
+                mine: f.is_mine,
+                transfer: match (&f.status, f.is_mine) {
+                    (_, true) => TransferState::Mine,
+                    (None, _) => TransferState::Available,
+                    (Some(DownloadStatus::Bezig { ontvangen, totaal }), _) => {
+                        TransferState::Running {
+                            received: *ontvangen,
+                            total: *totaal,
+                        }
+                    }
+                    (Some(DownloadStatus::Voltooid), _) => TransferState::Done,
+                    (Some(DownloadStatus::Mislukt(e)), _) => {
+                        TransferState::Failed { error: e.clone() }
+                    }
+                },
+                image_path,
+                local_path,
+                opens_folder: files::opent_als_code(&f.name),
+            },
+        ));
+    }
+
+    items.sort_by_key(|(lamport, author, _, _)| (*lamport, *author));
+
+    // The daily Wordle card is not an op, so it has no lamport to sort on — it is placed
+    // by the clock instead, right before the first thing said after 07:00 that day. A file
+    // carries no clock of its own (`at == 0`) and inherits the last one seen, the same way
+    // the frontend draws it.
+    let mut kaarten = if channel == Channel::GENERAL {
+        let mut k = wordle_cards(snap, me, &hues);
+        if let Some(c) = snap.clips.as_ref().and_then(|c| c.kaart.as_ref()) {
+            k.push((
+                c.at,
+                TimelineItem::Clip {
+                    at: c.at,
+                    size: c.grootte,
+                    shared: c.gedeeld,
+                },
+            ));
+            k.sort_by_key(|(op, _)| *op);
+        }
+        k.into_iter().peekable()
+    } else {
+        Vec::new().into_iter().peekable()
+    };
+    let mut uit: Vec<TimelineItem> = Vec::with_capacity(items.len());
+    let mut laatste = 0i64;
+    for (_, _, at, item) in items {
+        let at = if at > 0 { at } else { laatste };
+        while kaarten.peek().is_some_and(|(op, _)| *op <= at) {
+            if let Some((_, kaart)) = kaarten.next() {
+                uit.push(kaart);
+            }
+        }
+        laatste = at;
+        uit.push(item);
+    }
+    uit.extend(kaarten.map(|(_, kaart)| kaart));
+    uit
+}
+
+/// The board and the leaderboard. Kept out of `UiState::build` only because that function
+/// is long enough; nothing here decides anything the engine has not already decided.
+fn wordle_state(snap: &Snapshot, me: PeerId, hues: &HashMap<PeerId, u8>) -> WordleState {
+    let standings = wordle::standen(&snap.timeline.wordle)
+        .into_iter()
+        .map(|st| WordleStanding {
+            peer: st.peer.to_string(),
+            name: display_name(snap, st.peer, &st.peer.to_string()[..8]),
+            avatar: hues.get(&st.peer).copied().unwrap_or(3),
+            mine: st.peer == me,
+            points: st.punten,
+            played: st.gespeeld,
+            solved: st.opgelost,
+        })
+        .collect();
+
+    WordleState {
+        day: snap.wordle.dag,
+        board: snap.wordle.bord.as_ref().map(|b| WordleBoard {
+            number: b.nummer,
+            rows: b
+                .rijen
+                .iter()
+                .map(|r| WordleRow {
+                    word: r.woord.clone(),
+                    marks: r.tekens.iter().map(|t| *t as u8).collect(),
+                })
+                .collect(),
+            done: b.klaar,
+            won: b.gewonnen,
+            solution: b.oplossing.clone(),
+            seconds: b.seconden,
+        }),
+        error: snap.wordle.fout.clone(),
+        standings,
+        tries: wordle::POGINGEN,
+    }
+}
+
+/// One card per Wordle day, with the time it belongs at. Sorted oldest first.
+///
+/// A day shows up here as soon as *either* this machine fetched its word, *or* somebody's
+/// result for it arrived, *or* somebody put the card in the chat by hand (the + menu, an
+/// `OpKind::WordleCard`). The second case is the day you were away and the others played;
+/// the third is the day your own fetch failed, so you have no word and would otherwise draw
+/// nothing at all.
+///
+/// Never a day beyond the current one: a peer with a fast clock must not be able to put
+/// tomorrow's card in today's log.
+///
+/// **Where the card sits.** Normally at 07:00, the hour it belongs to. A day somebody
+/// announced by hand sits at the moment they pressed the button instead — that is the whole
+/// point of the button, since a card at 07:00 is buried above a day's worth of messages.
+/// That time comes off another machine's clock, so it is clamped to `[07:00, now]`: a peer
+/// whose clock is wrong may not fling the card to 1970 or into next week.
+fn wordle_cards(
+    snap: &Snapshot,
+    me: PeerId,
+    hues: &HashMap<PeerId, u8>,
+) -> Vec<(i64, TimelineItem)> {
+    let per_dag: HashMap<u32, &[fitcom_store::WordleEntry]> =
+        wordle::per_dag(&snap.timeline.wordle)
+            .into_iter()
+            .filter_map(|groep| groep.first().map(|e| (e.day, groep)))
+            .collect();
+
+    let kaarten = &snap.timeline.wordle_cards;
+
+    let mut dagen: Vec<u32> = snap
+        .wordle
+        .nummers
+        .keys()
+        .copied()
+        .chain(per_dag.keys().copied())
+        .chain(kaarten.keys().copied())
+        .filter(|d| *d <= snap.wordle.dag)
+        .collect();
+    dagen.sort_unstable();
+    dagen.dedup();
+
+    dagen
+        .into_iter()
+        .map(|day| {
+            let groep = per_dag.get(&day).copied().unwrap_or(&[]);
+            let winners = wordle::winnaars(groep);
+            let mut results: Vec<WordleScore> = groep
+                .iter()
+                .map(|e| WordleScore {
+                    peer: e.author.to_string(),
+                    name: display_name(snap, e.author, &e.author.to_string()[..8]),
+                    avatar: hues.get(&e.author).copied().unwrap_or(3),
+                    mine: e.author == me,
+                    guesses: e.guesses,
+                    solved: e.solved,
+                    pattern: e.pattern.clone(),
+                    seconds: e.seconds,
+                    won: winners.contains(&e.author),
+                })
+                .collect();
+            // Best first: whoever solved it, in the fewest guesses, and then the quickest
+            // — the same order the point is handed out in, so the winner sits on top. An
+            // unmeasured time sorts last, exactly as it scores. A peer id breaks what is
+            // left over, so every machine draws the same order.
+            fn sorteersleutel(s: &WordleScore) -> (bool, u8, u32, &str) {
+                (!s.solved, s.guesses, s.seconds.unwrap_or(u32::MAX), &s.peer)
+            }
+            results.sort_by(|a, b| sorteersleutel(a).cmp(&sorteersleutel(b)));
+
+            let vandaag = day == snap.wordle.dag;
+            let action = match (vandaag, snap.wordle.bord.as_ref()) {
+                (false, _) => "past",
+                (true, None) => "waiting",
+                (true, Some(b)) if b.klaar => "done",
+                (true, Some(b)) if b.rijen.is_empty() => "play",
+                (true, Some(_)) => "continue",
+            };
+
+            // 07:00, tenzij iemand de kaart met de hand in de chat zette — dan daar, maar
+            // nooit vóór 07:00 en nooit in de toekomst. Zie de doc hierboven.
+            // Niet `clamp`: die paniekt als de ondergrens boven de bovengrens uitkomt, en
+            // dat mag nooit van een klok afhangen in de tekenlaag.
+            let op_moment = kaarten.get(&day).map_or(wordle::openbaar_op(day), |k| {
+                k.at.max(wordle::openbaar_op(day))
+                    .min(fitcom_store::now_millis().max(wordle::openbaar_op(day)))
+            });
+
+            (
+                op_moment,
+                TimelineItem::Wordle {
+                    day,
+                    at: op_moment,
+                    // Wat deze pc zelf weet gaat voor; het nummer uit de aankondiging is
+                    // de terugval voor de dag die we nooit opgehaald kregen. `0` betekent
+                    // daar "onbekend", en dan tekent de kaart gewoon geen nummer.
+                    number: snap
+                        .wordle
+                        .nummers
+                        .get(&day)
+                        .copied()
+                        .or_else(|| kaarten.get(&day).map(|k| k.number).filter(|n| *n != 0)),
+                    action: action.to_string(),
+                    progress: if vandaag {
+                        snap.wordle.bord.as_ref().map_or(0, |b| b.rijen.len() as u8)
+                    } else {
+                        0
+                    },
+                    results,
+                    scored: wordle::telt_mee(groep),
+                },
+            )
+        })
+        .collect()
+}
+
+/// Whether a message or file belongs to the conversation on screen.
+///
+/// For a public channel that is plain equality. For a DM it is subtler: `Channel::dm(x)`
+/// means "the author DM'd x", so *my* messages to X carry `Dm(X)` while X's replies to me
+/// carry `Dm(me)` — not `Dm(X)`. One conversation is therefore two channel values, one
+/// per participant, and comparing against the open channel alone shows only your own half
+/// of it. That was a real bug once; the tests below are what keep it fixed.
+pub fn belongs_to_channel(open: Channel, me: PeerId, channel: Channel, author: PeerId) -> bool {
+    match open.dm_peer() {
+        Some(other) => match channel.dm_peer() {
+            // Mine to them, or theirs to me. Anything else is a different conversation.
+            Some(target) => (author == me && target == other) || (author == other && target == me),
+            None => false,
+        },
+        None => channel == open,
+    }
+}
+
+#[cfg(test)]
+mod router_tests {
+    use super::router_line;
+    use fitcom_net::bereik::Bereik;
+
+    #[test]
+    fn the_router_line_says_what_was_measured() {
+        // Sample router with PCP, NAT-PMP and a public IPv4 address.
+        let sample = Bereik {
+            gateway: true,
+            upnp: false,
+            pcp: true,
+            nat_pmp: true,
+            extern_v4: Some("203.0.113.10".parse().unwrap()),
+            ipv6: false,
+            gemapt: None,
+        };
+        assert_eq!(
+            router_line(&sample),
+            "Router: PCP yes \u{b7} NAT-PMP yes \u{b7} UPnP no \u{b7} public IPv4 \u{b7} no IPv6"
+        );
+        // B2: met port mapping ook waar de router de poort opende.
+        let open = Bereik {
+            gemapt: Some("203.0.113.10:41650".parse().unwrap()),
+            ..sample.clone()
+        };
+        assert!(router_line(&open).ends_with("no IPv6 \u{b7} open at 203.0.113.10:41650"));
+        let cgnat = Bereik {
+            gateway: true,
+            upnp: true,
+            extern_v4: Some("100.64.0.2".parse().unwrap()),
+            ipv6: true,
+            ..Bereik::default()
+        };
+        assert!(router_line(&cgnat).ends_with("UPnP yes \u{b7} CGNAT \u{b7} IPv6"));
+        let zwijgt = Bereik {
+            gateway: true,
+            ..Bereik::default()
+        };
+        assert!(router_line(&zwijgt).contains("outside address unknown"));
+        // Geen router gevonden is iets anders dan een router die niets kan.
+        assert!(router_line(&Bereik::default()).contains("not found"));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_picture_past_the_gpu_ceiling_is_not_drawn_inline() {
+        let dir = std::env::temp_dir().join(format!("fitcom-inline-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fits = dir.join("fits.png");
+        let wide = dir.join("wide.png");
+        image::RgbaImage::new(MAX_INLINE_SIDE, 1)
+            .save(&fits)
+            .unwrap();
+        image::RgbaImage::new(MAX_INLINE_SIDE + 1, 1)
+            .save(&wide)
+            .unwrap();
+        let drawn = (drawable_inline(&fits), drawable_inline(&wide));
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(drawn, (true, false));
+    }
+
+    #[test]
+    fn animated_or_renamed_gifs_never_reach_gpuis_unbounded_decoder() {
+        let dir = std::env::temp_dir().join(format!("fitcom-inline-gif-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let gif = dir.join("animation.gif");
+        let renamed = dir.join("animation.png");
+        let mut bytes = Vec::new();
+        {
+            let mut encoder = image::codecs::gif::GifEncoder::new(&mut bytes);
+            for _ in 0..3 {
+                encoder
+                    .encode_frame(image::Frame::new(image::RgbaImage::new(2, 2)))
+                    .unwrap();
+            }
+        }
+        std::fs::write(&gif, &bytes).unwrap();
+        std::fs::write(&renamed, &bytes).unwrap();
+        assert!(!drawable_inline(&gif));
+        assert!(!drawable_inline(&renamed));
+        // The files stay available for an explicit download/open action.
+        assert!(gif.is_file() && renamed.is_file());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn inline_images_have_encoded_and_decoded_memory_budgets() {
+        let dir = std::env::temp_dir().join(format!("fitcom-inline-budget-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("picture.bmp");
+        // BMP's fixed-size header lets this test advertise an excessive decoded area
+        // without allocating that area or requiring a large compressed test fixture.
+        let mut header = [0u8; 54];
+        header[..2].copy_from_slice(b"BM");
+        header[2..6].copy_from_slice(&54u32.to_le_bytes());
+        header[10..14].copy_from_slice(&54u32.to_le_bytes());
+        header[14..18].copy_from_slice(&40u32.to_le_bytes());
+        header[18..22].copy_from_slice(&8192u32.to_le_bytes());
+        header[22..26].copy_from_slice(&8192u32.to_le_bytes());
+        header[26..28].copy_from_slice(&1u16.to_le_bytes());
+        header[28..30].copy_from_slice(&24u16.to_le_bytes());
+        std::fs::write(&path, header).unwrap();
+        assert_eq!(image::image_dimensions(&path).unwrap(), (8192, 8192));
+        assert!(!drawable_inline(&path));
+
+        image::RgbaImage::new(2, 2).save(&path).unwrap();
+        assert!(drawable_inline(&path));
+        let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.set_len(MAX_INLINE_BYTES + 1).unwrap();
+        drop(file);
+        assert!(!drawable_inline(&path));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn peer(n: u8) -> PeerId {
+        let mut b = [0u8; 16];
+        b[0] = n;
+        PeerId::from_bytes(b)
+    }
+
+    fn topic(n: u8) -> TopicId {
+        TopicId::from_bytes([n; 16])
+    }
+
+    #[test]
+    fn a_subchannel_shows_only_its_own_messages() {
+        let open = Channel::topic(topic(1));
+        assert!(belongs_to_channel(open, peer(1), open, peer(2)));
+        assert!(!belongs_to_channel(
+            open,
+            peer(1),
+            Channel::topic(topic(2)),
+            peer(2)
+        ));
+        assert!(!belongs_to_channel(
+            open,
+            peer(1),
+            Channel::GENERAL,
+            peer(2)
+        ));
+    }
+
+    #[test]
+    fn the_general_channel_shows_no_subchannel_messages() {
+        assert!(!belongs_to_channel(
+            Channel::GENERAL,
+            peer(1),
+            Channel::topic(topic(1)),
+            peer(2)
+        ));
+        assert!(belongs_to_channel(
+            Channel::GENERAL,
+            peer(1),
+            Channel::GENERAL,
+            peer(2)
+        ));
+    }
+
+    #[test]
+    fn a_dm_shows_both_sides_of_the_conversation() {
+        let me = peer(1);
+        let other = peer(2);
+        let open = Channel::dm(other);
+        // Mine, addressed to them.
+        assert!(belongs_to_channel(open, me, Channel::dm(other), me));
+        // Theirs, addressed to me — the half a plain equality check would drop.
+        assert!(belongs_to_channel(open, me, Channel::dm(me), other));
+    }
+
+    #[test]
+    fn a_dm_shows_no_messages_from_another_conversation() {
+        let me = peer(1);
+        let open = Channel::dm(peer(2));
+        assert!(!belongs_to_channel(open, me, Channel::dm(peer(3)), me));
+        assert!(!belongs_to_channel(open, me, Channel::dm(me), peer(3)));
+        assert!(!belongs_to_channel(open, me, Channel::GENERAL, peer(2)));
+    }
+
+    #[test]
+    fn channel_keys_survive_a_round_trip() {
+        for c in [
+            Channel::GENERAL,
+            Channel::dm(peer(7)),
+            Channel::topic(topic(9)),
+        ] {
+            assert_eq!(parse_channel(&channel_key(c)), c);
+        }
+    }
+
+    /// The card is not an op, so it has no lamport — it is slotted in by the clock. This
+    /// is the test for that seam: 07:00 comes after anything said at 06:00 and before
+    /// anything said at 08:00, on the day it belongs to.
+    #[test]
+    fn the_wordle_card_lands_at_seven_in_the_morning() {
+        let dag = 20_260_820;
+        let zeven = crate::wordle::openbaar_op(dag);
+        let uur = 3_600_000;
+
+        let bericht = |lamport: u64, at: i64| fitcom_store::Message {
+            id: OpId::new(peer(1), Channel::GENERAL, lamport),
+            author: peer(1),
+            channel: Channel::GENERAL,
+            body: format!("at {at}"),
+            created_at: at,
+            edited: false,
+            lamport,
+            reply_to: None,
+        };
+        let timeline = fitcom_store::Timeline {
+            messages: vec![
+                bericht(1, zeven - uur),
+                bericht(2, zeven + uur),
+                bericht(3, zeven + 2 * uur),
+            ],
+            wordle: vec![fitcom_store::WordleEntry {
+                day: dag,
+                author: peer(2),
+                guesses: 3,
+                solved: true,
+                pattern: "2".repeat(15),
+                seconds: Some(120),
+            }],
+            ..Default::default()
+        };
+        let snap = Snapshot {
+            timeline: std::sync::Arc::new(timeline),
+            wordle: crate::engine::WordleView {
+                dag,
+                nummers: [(dag, 1888)].into_iter().collect(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let soorten: Vec<&str> = timeline_of(&snap, Channel::GENERAL, peer(1), "me")
+            .iter()
+            .map(|i| match i {
+                TimelineItem::Wordle { .. } => "card",
+                _ => "message",
+            })
+            .collect();
+        assert_eq!(soorten, ["message", "card", "message", "message"]);
+
+        // And nowhere else: a DM is not where the daily puzzle shows up.
+        assert!(!timeline_of(&snap, Channel::dm(peer(2)), peer(1), "me")
+            .iter()
+            .any(|i| matches!(i, TimelineItem::Wordle { .. })));
+    }
+
+    /// The local clip card sits in #general only, carries what the engine says about the
+    /// last clip, and is not an op: no clip in the snapshot, no card.
+    #[test]
+    fn the_clip_card_is_general_only_and_follows_the_snapshot() {
+        let mut snap = Snapshot::default();
+        let has = |s: &Snapshot, ch| {
+            timeline_of(s, ch, peer(1), "me")
+                .iter()
+                .any(|i| matches!(i, TimelineItem::Clip { .. }))
+        };
+        assert!(!has(&snap, Channel::GENERAL));
+        snap.clips = Some(crate::clips::ClipsWeergave {
+            aanwezig: true,
+            aan: true,
+            venster_sec: 60,
+            monitor: None,
+            hotkey: "F9".into(),
+            map: String::new(),
+            laatste: None,
+            fout: None,
+            auto_delen: false,
+            fps: 60,
+            resolutie: "native".into(),
+            kwaliteit: "high".into(),
+            kan_delen: true,
+            kaart: Some(crate::clips::ClipKaart {
+                at: 5,
+                grootte: 7,
+                gedeeld: false,
+            }),
+        });
+        assert!(has(&snap, Channel::GENERAL));
+        assert!(!has(&snap, Channel::dm(peer(2))));
+    }
+
+    /// A day this machine never fetched still gets a card as soon as somebody's result
+    /// arrives — that is the day you were away — but a day beyond the current one never
+    /// does, however far ahead the other peer's clock runs.
+    #[test]
+    fn a_card_appears_for_a_missed_day_and_never_for_a_future_one() {
+        let vandaag = 20_260_820;
+        let timeline = fitcom_store::Timeline {
+            wordle: vec![
+                fitcom_store::WordleEntry {
+                    day: 20_260_819,
+                    author: peer(2),
+                    guesses: 4,
+                    solved: true,
+                    pattern: String::new(),
+                    seconds: None,
+                },
+                fitcom_store::WordleEntry {
+                    day: 20_260_821,
+                    author: peer(2),
+                    guesses: 2,
+                    solved: true,
+                    pattern: String::new(),
+                    seconds: None,
+                },
+            ],
+            ..Default::default()
+        };
+        let snap = Snapshot {
+            timeline: std::sync::Arc::new(timeline),
+            wordle: crate::engine::WordleView {
+                dag: vandaag,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let dagen: Vec<u32> = timeline_of(&snap, Channel::GENERAL, peer(1), "me")
+            .iter()
+            .filter_map(|i| match i {
+                TimelineItem::Wordle { day, .. } => Some(*day),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(dagen, [20_260_819], "morgen hoort er niet bij te staan");
+    }
+
+    /// The fixture mode loads what this module serializes. A field that serializes but does
+    /// not come back (a missing `Deserialize`, a rename on one side only) fails here.
+    #[test]
+    fn the_state_and_the_timeline_survive_a_json_round_trip() {
+        let constants = Constants {
+            me: peer(1),
+            fallback_name: "me".into(),
+            sound_sets: Vec::new(),
+            sound_events: Vec::new(),
+            control_port: 1,
+            media_port: 2,
+            autostart: false,
+            minimize_to_tray: true,
+        };
+        let state = UiState::build(&Snapshot::default(), &constants, 7, &HashMap::new());
+        let back: UiState = serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
+        assert_eq!(back, state);
+
+        let op = OpRef::of(OpId::new(peer(2), Channel::GENERAL, 3));
+        let items = vec![
+            TimelineItem::Message {
+                id: op.clone(),
+                author: peer(2).to_string(),
+                author_name: "two".into(),
+                avatar: 2,
+                body: "hi".into(),
+                at: 5,
+                edited: false,
+                mine: false,
+                mentions_you: true,
+                reply_to: Some(op.clone()),
+                reply_snippet: Some(ReplySnippet {
+                    author_name: "two".into(),
+                    body: "earlier".into(),
+                }),
+                reactions: vec![ReactionState {
+                    emoji: "+".into(),
+                    count: 1,
+                    peers: vec![peer(1).to_string()],
+                    mine: true,
+                }],
+            },
+            TimelineItem::File {
+                id: op,
+                author: peer(2).to_string(),
+                author_name: "two".into(),
+                avatar: 2,
+                name: "a.png".into(),
+                size: 9,
+                at: 0,
+                mine: false,
+                transfer: TransferState::Running {
+                    received: 1,
+                    total: 9,
+                },
+                image_path: None,
+                local_path: None,
+                opens_folder: false,
+            },
+        ];
+        let back: Vec<TimelineItem> =
+            serde_json::from_str(&serde_json::to_string(&items).unwrap()).unwrap();
+        assert_eq!(back, items);
+    }
+
+    #[test]
+    fn a_reply_snippet_never_cuts_a_character_in_half() {
+        // Byte 90 falls inside the é: `String::truncate(90)` panicked here.
+        let body = format!("{}é en de rest", "a".repeat(89));
+        let snippet = reply_snippet(&body);
+        assert_eq!(snippet.chars().count(), REPLY_SNIPPET_LEN);
+        assert!(snippet.ends_with('é'));
+    }
+
+    #[test]
+    fn every_peer_gets_its_own_avatar_hue() {
+        let peers: Vec<PeerView> = [2u8, 3, 4]
+            .iter()
+            .map(|n| PeerView {
+                label: String::new(),
+                address: String::new(),
+                peer_id: Some(peer(*n)),
+                status: fitcom_net::PeerStatus::Connecting,
+                in_voice: false,
+                niveau: 0.0,
+                spreekt: false,
+                volume: 1.0,
+                user_status: None,
+                activiteit: None,
+                muted: false,
+                deafened: false,
+                plek: 0,
+            })
+            .collect();
+        // Three peers plus me is four identities, so one hue repeats — but never within
+        // the three the hashing version collided on.
+        let hues = avatar_hues(peer(1), &peers[..2]);
+        let mut seen: Vec<u8> = hues.values().copied().collect();
+        seen.sort_unstable();
+        assert_eq!(seen, vec![1, 2, 3]);
+        // Stable: the same set gives the same assignment every time.
+        assert_eq!(avatar_hues(peer(1), &peers), avatar_hues(peer(1), &peers));
+    }
+}

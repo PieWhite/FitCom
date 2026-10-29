@@ -1,0 +1,54 @@
+/target/
+/target-*/
+/.private/
+/dist/
+/release/
+*.exe
+*.dll
+*.pdb
+
+# Local assistant/editor instructions and session material never belong in a release.
+AGENTS.md
+CLAUDE.md
+/.agents/
+/.codex/
+/.claude/
+/.clinerules/
+/.cursor/
+/.windsurf/
+/.opencode/
+/.impeccable/
+/.idea/
+/.vscode/
+
+# Signing keys, credentials, recordings, and machine-specific configuration.
+.env
+.env.*
+!.env.example
+*.pk8
+*.pem
+*.key
+*.pfx
+*.p12
+*.log
+*.dmp
+*.mp4
+*.wav
+identity.toml
+/config.toml
+!/.cargo/config.toml
+adressen.json
+bestandspaden.json
+
+# Lokale runtime-data: config, database, logs, certificaten.
+# Portable modus schrijft deze naast de exe.
+/data/
+/logs/
+/.localpeers/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+fitcom.toml
+
+.DS_Store
+Thumbs.db

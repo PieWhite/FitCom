@@ -1,0 +1,5171 @@
+//! De motor: bezit de mesh, de oplog en de voice-sessie. Draait op de tokio-runtime.
+//!
+//! # Waarom dit niet in de UI zit
+//!
+//! Een venster tekent niet zolang het verborgen of geminimaliseerd is. Zat de chat- en
+//! sync-lus in de weergavelus, dan stopt de synchronisatie zodra je minimaliseert of naar
+//! de tray gaat — precies het moment waarop je een melding zou willen krijgen dat er
+//! iemand iets zegt. Voor een app die naast een game moet kunnen draaien is dat het
+//! verkeerde gedrag. Dat gold voor egui, gold voor de webview van fase 12, en geldt
+//! onverkort voor GPUI.
+//!
+//! De UI leest daarom alleen nog een momentopname en stuurt commando's terug. Zij mag
+//! stilvallen zonder dat er iets misgaat.
+
+use crate::chat::Chat;
+use crate::codes::{self, CodeWeigering, CodesUitslag, Koppeling};
+use crate::config::{self, Config, OverlayConfig, PushToTalkConfig, SoundConfig, VideoConfig};
+use crate::files::{self, DownloadStatus, Files, StartUpload};
+use crate::gebruik::{self, Gebruik};
+use crate::geluid;
+use crate::notify;
+use crate::release::{self, Release};
+use crate::streams::{Actie, DeelOpties, Streams};
+use crate::tags;
+use crate::updates::{UpdateStatus, Updates};
+use crate::wordle::{self, Wordle};
+use anyhow::{Context, Result};
+use fitcom_audio::{PeerAdres, VoiceConfig, VoiceHandle};
+use fitcom_net::{MeshCommand, MeshEvent, MeshHandle, PeerStatus, RecvStream, SendStream};
+use fitcom_proto::control::{
+    Activity, MusicAction, MusicControl, StreamKind, Typing, UserStatus, UserStatusValue,
+    VoiceJoin, VoiceLeave, VoiceState,
+};
+use fitcom_proto::{Channel, ControlMsg, OpId, OpKind, PeerId, TopicId};
+use fitcom_store::{FileEntry, Store, Timeline};
+use fitcom_video::{Bron, BronSoort, Codec, D3dContext, DelerConfig, DelerHandle};
+use fitcom_video::{KijkerConfig, KijkerEvent, KijkerHandle, Miniatuur};
+use std::collections::{HashMap, HashSet};
+use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio::io::{AsyncSeekExt, AsyncWriteExt};
+use tokio::sync::{mpsc, oneshot, watch};
+
+/// Snel genoeg voor een spreekindicatie die niet hakkelt. Een momentopname is goedkoop:
+/// de timeline zit erin als `Arc`, dus publiceren kost geen kopie van de geschiedenis.
+const TIK: Duration = Duration::from_millis(100);
+/// Een scherm laten bedienen kan alleen op Windows (beslissing 54): op macOS is er geen
+/// `SendInput`-tegenhanger gebouwd, dus een mac-deler kondigt het nooit aan.
+const BEDIENEN_KAN: bool = cfg!(windows);
+
+/// Hoe vaak de terugblik opnieuw uitgerekend wordt. Hij loopt over de hele oplog, en
+/// niemand kijkt naar de seconde nauwkeurig naar een weekoverzicht. Meteen ook het moment
+/// waarop de gemeten tijd naar schijf gaat, dus een crash kost hoogstens deze minuut.
+const OVERZICHT_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Hoe vaak een lopende download zijn voortgang naar de UI duwt. Bij 1 Gbit komen er
+/// per seconde veel te veel gelezen stukjes langs om elk apart te melden.
+const VOORTGANG_INTERVAL: Duration = Duration::from_millis(200);
+
+/// Eigen versie. Gaat mee in de handshake (peers tonen elkaars versie) en is sinds fase
+/// 13 waar de release-feed tegen vergeleken wordt (`fitcom_proto::is_newer`).
+const EIGEN_VERSIE: &str = env!("CARGO_PKG_VERSION");
+
+/// B-22: tot hier haalt de app een aangeboden afbeelding vanzelf op.
+///
+/// Een afbeelding is de enige soort die zichzelf downloadt én toont zonder dat er iemand
+/// klikt, dus dit is het enige pad waarlangs bytes ongevraagd binnenkomen. 16 MiB is ruim
+/// boven een schermafdruk of een foto uit een telefoon, en ver onder wat een schijf
+/// volschrijft. Groter blijft gewoon in de lijst staan met een downloadknop — dan is het
+/// een keuze in plaats van iets dat achter je rug gebeurt.
+///
+/// Dit begrenst het *ophalen*, niet het *decoderen*. Een 30000×30000 "decompression bomb"
+/// is een paar honderd kB op de draad en gigabytes gedecodeerd, en dat decoderen gebeurt
+/// sinds de GPUI-wissel in ons eigen proces. De grens daarvoor staat in
+/// `ui::state::MAX_INLINE_SIDE`; wat daar nog openstaat is B-61.
+const MAX_AUTO_AFBEELDING: u64 = 16 * 1024 * 1024;
+
+/// Hoe vaak de release-feed geraadpleegd wordt. Er is niets aan gelegen om er sneller
+/// bij te zijn, en dit is de enige verbinding die de app buiten het tailnet legt.
+const UPDATE_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
+/// Niet meteen bij het starten: eerst moet de mesh staan en moet de gebruiker zijn
+/// venster zien. Een feed-check die de start vertraagt is een check te vroeg.
+const UPDATE_EERSTE_CHECK: Duration = Duration::from_secs(60);
+/// Wanneer de routerprobe (A0) loopt: kort na het starten, zie `Engine::run`.
+const BEREIK_NA: Duration = Duration::from_secs(10);
+/// En nog één keer zo veel later als er de eerste keer geen router te vinden was.
+const BEREIK_OPNIEUW: Duration = Duration::from_secs(60);
+
+#[derive(Debug, Clone)]
+pub struct PeerView {
+    pub label: String,
+    pub address: String,
+    pub peer_id: Option<PeerId>,
+    pub status: PeerStatus,
+    /// Zit deze peer in het gesprek?
+    pub in_voice: bool,
+    /// 0..1, voor de spreekindicatie.
+    pub niveau: f32,
+    /// Komt er nu stem van hem binnen. Dit, niet `niveau`, drijft de spreekring.
+    pub spreekt: bool,
+    pub volume: f32,
+    /// De door de gebruiker gekozen status van deze peer, zoals hij hem zelf stuurde.
+    /// `None` zolang hij nog niets stuurde (of offline was): dan is hij impliciet
+    /// "online", en de UI hoeft niets extra's te tonen.
+    pub user_status: Option<UserStatusValue>,
+    /// Het spel dat bij deze peer vooraan staat, zoals hij het meldde en door `speelt::schoon`
+    /// gehaald. `None` zonder spel, of offline. Wisselt alleen als hij van spel wisselt.
+    pub activiteit: Option<String>,
+    /// Hij zette zichzelf op mute of deafen, zoals hij het meldde; alleen in het gesprek.
+    pub muted: bool,
+    pub deafened: bool,
+    /// Zijn plek in `cfg.peers` (het targetnummer), gezet in de momentopname. Verwijderde
+    /// peers staan daar niet in, dus de positie in die lijst is het niet.
+    pub plek: usize,
+}
+
+impl PeerView {
+    fn nieuw(label: String, address: String, peer_id: Option<PeerId>) -> Self {
+        Self {
+            label,
+            address,
+            peer_id,
+            status: PeerStatus::Offline {
+                reason: "nog niet verbonden".into(),
+            },
+            in_voice: false,
+            niveau: 0.0,
+            spreekt: false,
+            volume: 1.0,
+            user_status: None,
+            activiteit: None,
+            muted: false,
+            deafened: false,
+            plek: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct VoiceView {
+    pub actief: bool,
+    pub muted: bool,
+    pub deafened: bool,
+    pub eigen_niveau: f32,
+    /// Gaat er nu stem van ons uit (VAD en niet op mute).
+    pub eigen_spreekt: bool,
+}
+
+/// Een bron die wij delen, zoals de UI hem toont.
+#[derive(Debug, Clone)]
+pub struct EigenStreamView {
+    pub stream_id: u32,
+    pub titel: String,
+    pub kijkers: usize,
+    pub is_geluid: bool,
+    /// Ons gedeelde Spotify-geluid. Ook `is_geluid`; de titel is wat er nu speelt.
+    pub is_muziek: bool,
+    /// Onze eigen camera in plaats van een scherm. De UI heeft dit nodig om de
+    /// camera-knop ingedrukt te tonen en om te weten welke stream hij weer uitzet.
+    pub is_camera: bool,
+    /// Terugblik op wat wij zelf uitsturen, voor de tegel in de streamstrook. `None` zolang
+    /// er geen deler draait (een scherm zonder kijkers) en tot het eerste beeld binnen is.
+    pub miniatuur: Option<Miniatuur>,
+    /// Wat de kijkers op dit scherm tekenden, en of dat mag (beslissing 45). Bewust niet in
+    /// `UiState`: het verandert terwijl iemand tekent. De tegel krijgt de lijnen via de
+    /// miniaturenpomp, alleen de schakelaar gaat de toestand in.
+    pub tekening: Arc<fitcom_proto::teken::Tekening>,
+    /// Mag dit scherm bediend worden (beslissing 54), wie vraagt het en wie doet het. Wisselt
+    /// alleen bij een vraag, een klik of een einde, dus het past in `UiState`.
+    pub bedienen: bool,
+    pub vrager: Option<PeerId>,
+    pub bediener: Option<PeerId>,
+    /// Een monitor op een platform dat zich laat bedienen: alleen dan een schakelaar.
+    pub kan_bedienen: bool,
+}
+
+/// Een bron die een ander deelt.
+#[derive(Debug, Clone)]
+pub struct StreamView {
+    pub eigenaar: PeerId,
+    pub stream_id: u32,
+    pub titel: String,
+    pub breedte: u32,
+    pub hoogte: u32,
+    pub kijken: bool,
+    /// Geluid in plaats van beeld: geen venster, wel een volumeschuif.
+    pub is_geluid: bool,
+    /// Iemands Spotify (ook `is_geluid`). Hoor je in het gesprek vanzelf, zonder te
+    /// kijken; de titel is "Artiest – Nummer".
+    pub is_muziek: bool,
+    /// Iemands camera in plaats van zijn scherm. Verder identiek — hetzelfde venster,
+    /// dezelfde miniatuur — alleen het icoontje in de lijst verschilt.
+    pub is_camera: bool,
+    pub volume: f32,
+    /// Verkleind beeld voor het overzicht in het hoofdvenster. `None` tot het eerste
+    /// beeld binnen is, en altijd `None` voor geluid.
+    pub miniatuur: Option<Miniatuur>,
+    /// Onze kopie van wat er op dit scherm getekend staat; leeg zolang we niet kijken.
+    pub tekening: Arc<fitcom_proto::teken::Tekening>,
+}
+
+/// Een aangeboden bestand zoals de UI het toont: de metadata uit de oplog plus, als wij
+/// er iets mee doen, onze eigen downloadstatus.
+#[derive(Debug, Clone)]
+pub struct FileView {
+    pub id: OpId,
+    pub author: PeerId,
+    /// Algemeen kanaal of een DM — bepaalt of dit bestand in de algemene lijst of in
+    /// een gespreksvenster hoort.
+    pub channel: Channel,
+    pub name: String,
+    pub size: u64,
+    /// Ons eigen aanbod: geen downloadknop nodig, we hebben het al.
+    pub is_mine: bool,
+    /// `None` betekent: nog niet gedownload en niet mee bezig.
+    pub status: Option<DownloadStatus>,
+    /// Zie `fitcom_store::timeline::Message::lamport` — bepaalt waar dit bestand tussen
+    /// de berichten in de tijdlijn komt te staan.
+    pub lamport: u64,
+    /// Voor een afbeelding: samen met `name`'s extensie het pad in `pictures_dir` waar
+    /// de UI een miniatuur vandaan kan laden, zie `files::hash_bestandsnaam`.
+    pub hash: [u8; 32],
+    /// Waar de bytes op deze pc staan, als we ze hebben: ons eigen aanbod of een
+    /// afgeronde download. `None` betekent dat er niets te openen valt. Zie
+    /// `files::Files::lokaal_pad`.
+    pub local_path: Option<PathBuf>,
+}
+
+/// Wordle, zoals de UI het toont. Zie `crate::wordle` voor de regels.
+#[derive(Debug, Clone, Default)]
+pub struct WordleView {
+    /// De dag waar het huidige raadsel bij hoort, `YYYYMMDD`. Wisselt om 07:00.
+    pub dag: u32,
+    /// Het bord van vandaag. `None` zolang het woord niet binnen is — dan is er geen
+    /// kaart en staat er niets in de weg.
+    pub bord: Option<wordle::Bord>,
+    /// Raadselnummer per dag die deze pc kent, voor de kop van een kaart. Alleen wat we
+    /// zelf ooit ophaalden; van een dag die we misten weten we het nummer niet.
+    pub nummers: HashMap<u32, u32>,
+    /// Waarom de laatste gok niet aangenomen werd. Engels: dit gaat rechtstreeks het
+    /// venster in.
+    pub fout: Option<String>,
+}
+
+/// Alles wat de UI nodig heeft om zichzelf te tekenen.
+#[derive(Debug, Clone, Default)]
+pub struct Snapshot {
+    pub timeline: Arc<Timeline>,
+    pub peers: Vec<PeerView>,
+    pub voice: VoiceView,
+    pub eigen_streams: Vec<EigenStreamView>,
+    pub streams: Vec<StreamView>,
+    pub video: VideoConfig,
+    /// Welke set tonen de app zelf maakt en hoe hard. Alleen voor het instellingenscherm;
+    /// het afspelen leest de config rechtstreeks.
+    pub geluid: SoundConfig,
+    /// Push-to-talk-modus en -toets, voor het instellingenscherm.
+    pub push_to_talk: PushToTalkConfig,
+    /// Meesturen welk spel er vooraan staat (`Config::share_activity`).
+    pub deel_activiteit: bool,
+    /// Het spel dat bij ons vooraan staat (`speelt::Rust::huidig`), voor "Stream <spel>".
+    pub eigen_spel: Option<String>,
+    /// Mogen kijkers op je scherm tekenen (`Config::allow_drawing`): de standaard voor een
+    /// nieuw scherm.
+    pub tekenen: bool,
+    /// Mogen kijkers vragen je monitor te bedienen (`Config::allow_remote_control`): de
+    /// standaard voor een nieuw scherm.
+    pub bedienen: bool,
+    /// Een nieuw gedeeld scherm vanzelf op het tweede scherm (`Config::auto_popout`).
+    pub auto_popout: bool,
+    /// Het gekozen scherm daarvoor (`Config::popout_monitor`).
+    pub popout_monitor: Option<String>,
+    /// De spraakoverlay (beslissing 53): aan of uit, en zijn plek bij het starten. De
+    /// overlay-thread houdt de plek daarna zelf bij en meldt een nieuwe met `ZetOverlayPlek`.
+    pub overlay: OverlayConfig,
+    /// Gekozen microfoon, of `None` voor het Windows-standaardapparaat. Alleen voor het
+    /// instellingenscherm: de sessie leest dit bij het starten uit de config.
+    pub input_device: Option<String>,
+    pub output_device: Option<String>,
+    /// Waar downloads nu landen. Volgt `cfg.download_dir`, dus reactief zodra de
+    /// gebruiker hem via het instellingenscherm wijzigt.
+    pub download_dir: PathBuf,
+    /// Waar de content-adresseerbare afbeeldingen staan (`<downloadmap>/Pictures`). Staat
+    /// hier en niet in `ui::Constants`, want hij verhuist mee met de downloadmap en de UI
+    /// leidt het pad van elke afbeelding er zelf uit af — zie
+    /// `config::resolve_pictures_dir` en `files::hash_bestandsnaam`.
+    pub pictures_dir: PathBuf,
+    /// Profielfoto's op schijf, per peer (ook wijzelf). Alleen deze paden mag het venster als
+    /// avatar tekenen (`Ui::image_path_allowed`); zie `crate::avatar`.
+    pub avatars: HashMap<PeerId, PathBuf>,
+    /// A0: wat de router en de interfaces over onze bereikbaarheid zeggen, één keer gemeten
+    /// kort na het starten. `None` zolang die meting loopt.
+    pub bereik: Option<fitcom_net::bereik::Bereik>,
+    pub files: Vec<FileView>,
+    pub ongelezen: usize,
+    /// Ongelezen DM-berichten per gesprekspartner. Los van `ongelezen` (het algemene
+    /// kanaal) — je kunt het een missen zonder het ander te missen.
+    pub ongelezen_dm: HashMap<PeerId, usize>,
+    /// Ongelezen berichten per subkanaal onder het algemene kanaal (fase 9). Los van
+    /// zowel `ongelezen` als `ongelezen_dm`.
+    pub ongelezen_topic: HashMap<TopicId, usize>,
+    /// Onderdrukt alle Windows-meldingen, ook een directe tag naar jezelf. Geldt alleen
+    /// voor deze sessie, net als mute/deafen — geen configvermelding.
+    pub niet_storen: bool,
+    /// Clips (fase 15): ringbuffer-opname met hotkey. `None` op platforms zonder
+    /// clipondersteuning — de UI verbergt er alles omheen.
+    pub clips: Option<crate::clips::ClipsWeergave>,
+    /// Wie nu aan het typen is: (kanaal, peer). Vluchtig — alleen levende indicaties
+    /// van verbonden peers, zie `TYPING_TTL`.
+    pub typing: Vec<(Channel, PeerId)>,
+    /// Onze eigen gekozen status (`UserStatusValue`). Vluchtig, begint op online.
+    pub eigen_status: UserStatusValue,
+    /// Fase 11: staat een peer met een nieuwere versie aangeboden/onderweg/klaar?
+    /// `None` betekent: niets aan de hand, iedereen die we spreken zit op onze versie
+    /// (of ouder).
+    pub update: Option<UpdateStatus>,
+    /// Het spelletje van de dag en het scorebord (2026-08-20).
+    pub wordle: WordleView,
+    /// De terugblik over de afgelopen week. Bewust **niet** in `UiState`: hij verandert
+    /// elke seconde en zou dan bij elke tik een `state`-event afdwingen. De UI haalt hem
+    /// met `get_recap` uit deze momentopname op, net als de tijdlijn.
+    pub overzicht: Arc<gebruik::Overzicht>,
+    /// De eigen uitnodigingscode (B1). Verandert alleen als de eigen adressen of de naam
+    /// veranderen.
+    pub uitnodiging: String,
+    /// Wat er van de laatste keer codes plakken terechtkwam.
+    pub codes_uitslag: Option<CodesUitslag>,
+    pub fout: Option<String>,
+}
+
+#[derive(Debug)]
+pub enum UiCommand {
+    /// Kanaal erbij: het algemene kanaal, of een DM met de gekozen peer. Met een
+    /// `reply_to` wordt het bericht een antwoord op dat bericht.
+    Plaats(String, Channel, Option<OpId>),
+    Bewerk(OpId, String),
+    Verwijder(OpId),
+    /// Reactie op een bericht zetten of (als hij er al staat) intrekken.
+    Reageer(OpId, String),
+    /// "Ik ben aan het typen" in dit kanaal. Vluchtig; de motor throttle zelf.
+    Typing(Channel),
+    /// Eigen aanwezigheidsstatus: 0 online, 1 away, 2 busy (`UserStatusValue`).
+    ZetStatus(u8),
+    /// "Speelt X" meesturen aan of uit; wordt weggeschreven naar `config.toml`.
+    ZetActiviteitDelen(bool),
+    Gelezen,
+    /// Een DM-gesprek is bekeken; telt niet mee voor `Snapshot::ongelezen_dm`.
+    GelezenDm(PeerId),
+    /// Een subkanaal is bekeken; telt niet mee voor `Snapshot::ongelezen_topic`.
+    GelezenTopic(TopicId),
+    FoutWeg,
+    VoiceDeelnemen,
+    VoiceVerlaten,
+    Mute(bool),
+    Deafen(bool),
+    Volume(PeerId, f32),
+    /// Een scherm of venster gaan delen, met wat kijkers erop mogen (de kiezer). Er wordt nog
+    /// niets opgenomen. Bureaubladgeluid gaat vanzelf mee als je in het gesprek zit — geen
+    /// apart commando meer (fase 10).
+    DeelBron(Bron, DeelOpties),
+    /// Het venster van het spel dat we spelen delen, met één klik (`speelt::Zoeker::venster`).
+    DeelSpel,
+    StopDelen(u32),
+    /// De camera aan (`true`) of uit (`false`). Eén schakelaar in plaats van de UI laten
+    /// uitzoeken welke bron de camera is; bureaubladgeluid blijft er buiten.
+    ZetCamera(bool),
+    /// Het geluid van Spotify delen met iedereen in het gesprek (`true`) of daarmee
+    /// stoppen. Alleen Spotify, in stereo; zie `zet_spotify`.
+    DeelSpotify(bool),
+    /// Pauze/afspelen of volgende bij de Spotify die deze peer deelt (stream-id erbij).
+    /// Gaat als `MusicControl` naar die peer; zie `bij_muziekbediening` voor wat hij doet.
+    BedienMuziek(PeerId, u32, MusicAction),
+    Kijken(PeerId, u32),
+    StopKijken(PeerId, u32),
+    /// De standaard voor tekenen op een nieuw gedeeld scherm (beslissing 45, sinds 54 een
+    /// standaard). Uit zet het ook uit op elk scherm dat loopt en wist daar alles; aan laat
+    /// lopende schermen zoals ze zijn. Wordt opgeslagen (`Config::allow_drawing`).
+    ZetTekenen(bool),
+    /// Een nieuw gedeeld scherm vanzelf openen op het tweede scherm. Opgeslagen
+    /// (`Config::auto_popout`).
+    ZetAutoPopout(bool),
+    /// Op welk scherm dat venster komt, op naam. Leeg = een ander scherm dan dat vooraan.
+    ZetPopoutMonitor(String),
+    /// Hetzelfde voor bedienen (beslissing 54, `Config::allow_remote_control`). Uit maakt ook
+    /// een eind aan elke vraag en elk bedienen.
+    ZetBedienen(bool),
+    /// Tekenen op dit ene eigen scherm aan of uit.
+    ZetStreamTekenen(u32, bool),
+    /// Bedienen van dit ene eigen scherm toestaan of niet; uit maakt er een eind aan.
+    ZetStreamBedienen(u32, bool),
+    /// Allow: deze peer mag dit scherm nu bedienen (alleen als hij nog de vrager is).
+    StaBedieningToe(u32, PeerId),
+    /// Deny op de vraag voor dit scherm.
+    WeigerBediening(u32),
+    /// Het bedienen van dit scherm intrekken.
+    StopBediening(u32),
+    /// Alle lijnen op dit eigen scherm wissen, van iedereen.
+    WisTekening(u32),
+    /// De spraakoverlay aan of uit (beslissing 53). Wordt opgeslagen (`Config::overlay`).
+    ZetOverlay(bool),
+    /// De overlay ook zonder spel vooraan (`OverlayConfig::always`). Wordt opgeslagen.
+    ZetOverlayAltijd(bool),
+    /// De overlay is met Alt + slepen verplaatst: zijn nieuwe linkerbovenhoek. Eén keer per
+    /// sleep, aan het eind; wordt opgeslagen.
+    ZetOverlayPlek(i32, i32),
+    /// Volume van één stream van een peer, los van zijn stem.
+    StreamVolume(PeerId, u32, f32),
+    /// Codec, framerate en bitrate voor screenshare. Geldt voor delers die al lopen
+    /// meteen mee — die worden herstart met de nieuwe instellingen — en voor nieuw
+    /// gestarte bronnen vanzelf, want die lezen `cfg.video` bij het starten.
+    ZetVideoInstellingen(VideoConfig),
+    /// Microfoon en weergaveapparaat, `None` = het Windows-standaardapparaat. De
+    /// apparaten worden bij het openen van de voice-sessie gekozen, dus een lopend
+    /// gesprek wordt hiervoor kort herstart.
+    ZetGeluidsapparaten(Option<String>, Option<String>),
+    /// Nieuwe downloadmap. Bestaande downloads blijven staan waar ze stonden; alleen
+    /// nieuwe downloads landen vanaf nu op het nieuwe pad.
+    ZetDownloadMap(PathBuf),
+    /// Een lokaal bestand kiezen en aanbieden aan de anderen (of aan één DM-partner).
+    /// Hashen gebeurt op de motor: bij een groot bestand kan dat te lang duren om de UI
+    /// op te laten wachten.
+    BiedBestandAan(PathBuf, Channel),
+    /// Downloaden, of hervatten na een eerdere onderbreking.
+    DownloadBestand(OpId),
+    /// Eigen weergavenaam wijzigen. Legt een `SetNick`-op vast zodra de motor hem
+    /// verwerkt, net als bij het opstarten.
+    ZetNaam(String),
+    /// Eigen profielfoto: een gekozen plaatje, of `None` om hem weg te halen. Verkleinen
+    /// gebeurt op de motor zelf (een paar honderd ms bij een grote foto; één klik in Settings,
+    /// en voice en media draaien op eigen threads).
+    ZetAvatar(Option<PathBuf>),
+    /// Niet-storenmodus aan/uit. Onderdrukt alle Windows-meldingen, ook een tag.
+    NietStoren(bool),
+    /// Wist alle bestanden in `pictures_dir` van schijf. Raakt alleen lokale
+    /// schijfruimte — de kaarten blijven in de tijdlijn staan, net als bij een
+    /// bronbestand dat toevallig van schijf verdwijnt (zie `files.rs`).
+    VerwijderAlleAfbeeldingen,
+    /// Nieuw subkanaal onder het algemene kanaal aanmaken, met een titel.
+    MaakKanaal(String),
+    /// Bestaand subkanaal hernoemen. Zelfde mechanisme als aanmaken — zie
+    /// `Chat::zet_kanaal_titel`.
+    HernoemKanaal(TopicId, String),
+    /// Subkanaal verwijderen. UI vraagt hier eerst een bevestiging voor.
+    VerwijderKanaal(TopicId),
+    /// Welke set tonen en hoe hard. Wordt meteen weggeschreven naar `config.toml`.
+    ZetGeluidInstellingen(SoundConfig),
+    /// Modus (spraak, push-to-talk, push-to-mute) en toets. Geldt meteen, ook in een lopend
+    /// gesprek, en wordt weggeschreven naar `config.toml`.
+    ZetSpreektoets(PushToTalkConfig),
+    /// Eén toon laten horen om te kiezen. Negeert niet-storen: wie op de knop drukt vraagt
+    /// er expliciet om, en anders lijkt de knop stuk.
+    ProefGeluid(String),
+    /// Nu bij de release-feed kijken, op verzoek van de gebruiker. Anders dan de tik van
+    /// zes uur meldt deze elke uitkomst, ook "niets nieuws" en "feed onbereikbaar".
+    ZoekUpdate,
+    /// Fase 11: een klaarstaande update bevestigen — start het updaterproces en sluit de
+    /// app af.
+    PasUpdateToe,
+    /// Deze versie niet meer vanzelf aanbieden, deze sessie.
+    NegeerUpdate(String),
+    /// Een mislukte update-melding wegklikken.
+    WisUpdateMelding,
+    /// Eén gok op het Wordle-raadsel van vandaag. Het woord komt uit het venster; de
+    /// motor beoordeelt het, want de oplossing blijft aan deze kant.
+    WordleGok(String),
+    /// De kaart van vandaag met de hand in het algemene kanaal zetten, zodat *iedereen* hem
+    /// ziet — de reddingsklep uit het `+`-menu. Haalt het raadsel eerst op als deze pc het
+    /// nog niet heeft, want zonder dat valt er niets aan te kondigen.
+    WordleInChat,
+    /// Clipopname aan of uit, en dat meteen vastleggen in de config.
+    ZetClips(bool),
+    /// Nú de laatste `venster_sec` seconden als clip wegschrijven. Ook via de globale
+    /// hotkey, die hier op hetzelfde kanaal uitkomt.
+    ClipseNu,
+    /// De laatste clip als bestandsaanbod in het algemene kanaal (beslissing 44).
+    DeelLaatsteClip,
+    /// Clips automatisch delen (alleen in een gesprek) aan of uit.
+    ZetClipsAutoDelen(bool),
+    /// Welk scherm er voor clips opgenomen wordt (naam uit de bronlijst). Leeg =
+    /// automatisch het eerste.
+    ZetClipMonitor(String),
+    /// Hoe lang een clip is, in seconden (10 tot `config::MAX_CLIP_SEC`).
+    ZetClipLengte(u32),
+    /// Beeldtempo, resolutie en kwaliteit van clips, alle drie tegelijk; namen uit
+    /// `clips::CLIP_FPS`, `RESOLUTIES` en `KWALITEITEN`.
+    ZetClipBeeld {
+        fps: u32,
+        resolutie: String,
+        kwaliteit: String,
+    },
+    /// De globale clip-sneltoets wisselen, zonder herstart.
+    ZetClipsHotkey(String),
+    /// Waar clips (en de ring eronder) heen gaan. Een lopende opname verhuist mee.
+    ZetClipMap(PathBuf),
+    /// Geplakte tekst met één of meer uitnodigingscodes (fase B1).
+    VoegCodesToe(String),
+    /// Een peer verwijderen (`PeerView::plek`). Alleen hier; de anderen houden hem.
+    VerwijderPeer(usize),
+}
+
+pub struct EngineHandle {
+    pub snapshot: watch::Receiver<Arc<Snapshot>>,
+    pub commands: mpsc::Sender<UiCommand>,
+    /// Wordt door de UI bijgehouden. Staat het venster niet op de voorgrond, dan
+    /// verstuurt de motor een Windows-melding bij een nieuw bericht.
+    pub voorgrond: Arc<AtomicBool>,
+    /// Gaat aan zodra de gebruiker een klaarstaande update bevestigt en het
+    /// updater-proces gestart is. De UI sluit het venster dan net zo af als via het
+    /// tray-menu — zie `tray::wil_afsluiten` en `ui.rs::afsluiten_of_verbergen`.
+    pub afsluiten_voor_update: Arc<AtomicBool>,
+}
+
+pub fn spawn(
+    mesh: MeshHandle,
+    store: Store,
+    cfg: Config,
+    config_path: PathBuf,
+) -> Result<EngineHandle> {
+    let chat = Chat::new(store)?;
+    let (cmd_tx, cmd_rx) = mpsc::channel(64);
+    let (snap_tx, snap_rx) = watch::channel(Arc::new(Snapshot::default()));
+    let voorgrond = Arc::new(AtomicBool::new(true));
+    let (file_tx, file_rx) = mpsc::channel(64);
+    let (kijker_tx, kijker_rx) = mpsc::unbounded_channel();
+
+    // `config_path` staat altijd direct in de datamap (zie `main.rs`), dus dat is ook de
+    // basis voor de standaard downloadmap zolang de gebruiker er niets voor gekozen heeft.
+    let data_dir = config_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let downloads_dir = config::resolve_download_dir(&cfg, &data_dir);
+    std::fs::create_dir_all(&downloads_dir).context("downloadmap aanmaken")?;
+    let pictures_dir = config::resolve_pictures_dir(&cfg, &data_dir);
+    std::fs::create_dir_all(&pictures_dir).context("picturesmap aanmaken")?;
+    let updates_dir = config::resolve_updates_dir(&data_dir);
+    std::fs::create_dir_all(&updates_dir).context("updatesmap aanmaken")?;
+    // Tot 2026-08-20 stonden de afbeeldingen in de datamap. Ze verhuizen één keer mee,
+    // want hun pad is *afgeleid* (uit de hash) en niet onthouden: laten staan zou
+    // betekenen dat elke afbeelding van gisteren uit de tijdlijn verdwijnt.
+    let oude_picturesmap = data_dir.join("Pictures");
+    verhuis_afbeeldingen(&oude_picturesmap, &pictures_dir);
+    let paden_index = data_dir.join("bestandspaden.json");
+    let mut files = Files::new();
+    let (aangeboden, gedownload) = lees_paden_index(&paden_index, &oude_picturesmap, &pictures_dir);
+    files.herstel_paden(aangeboden, gedownload);
+    let afsluiten_voor_update = Arc::new(AtomicBool::new(false));
+    let clips_beheer = crate::clips::ClipsBeheer::nieuw(config::resolve_clips_dir(&cfg, &data_dir));
+
+    let peers = cfg
+        .peers
+        .iter()
+        .map(|p| {
+            let label = if p.label.is_empty() {
+                p.address.clone()
+            } else {
+                p.label.clone()
+            };
+            // Een peer uit een code heeft geen configadres; dan het eerste uit zijn code.
+            let adres = if p.address.is_empty() {
+                p.addresses
+                    .first()
+                    .map(|a| a.to_string())
+                    .unwrap_or_default()
+            } else {
+                p.address.clone()
+            };
+            PeerView::nieuw(label, adres, p.known_id)
+        })
+        .collect();
+
+    // Globale clip-hotkey (standaard F9, instelbaar). Eigen Win32-draad; hij duwt
+    // rechtstreeks op het motorcommandokanaal en werkt dus ook vanuit de tray. Vóór
+    // de Engine-aanmaak: `cfg` verhuist daarin, en de draad hoort bij het object.
+    let clip_hotkey_spec = cfg.clips.hotkey.clone();
+    let (clip_hotkey_verzender, clip_hotkey_ontvanger) = std::sync::mpsc::channel();
+    let hotkey_tx = clip_hotkey_verzender.clone();
+    let hotkey_draad = crate::clips::start_hotkey(&clip_hotkey_spec, move || {
+        let _ = hotkey_tx.send(());
+    })
+    .context("clip-hotkey registreren")
+    .unwrap_or_else(|e| {
+        tracing::warn!(error = %format!("{e:#}"), "hotkey uit; clips blijven via de UI werken");
+        crate::clips::HotkeyDraad::dode()
+    });
+
+    let streams = Streams::new();
+    let (bedien_tx, bedien_rx) = mpsc::unbounded_channel();
+
+    let engine = Engine {
+        mesh,
+        chat,
+        cfg,
+        config_path,
+        hotkey_draad,
+        peers,
+        verbonden: HashMap::new(),
+        voice: None,
+        peers_in_voice: HashSet::new(),
+        vanzelf_geopend: HashSet::new(),
+        streams,
+        d3d: None,
+        bronnen: HashMap::new(),
+        delers: HashMap::new(),
+        kijkers: HashMap::new(),
+        deellagen: HashMap::new(),
+        bedieners: HashMap::new(),
+        bedien_tx,
+        bedien_rx,
+        miniaturen: HashMap::new(),
+        stream_volumes: HashMap::new(),
+        nu_speelt: None,
+        files,
+        downloads_dir,
+        pictures_dir,
+        avatar_dir: data_dir.join("avatars"),
+        avatars: HashMap::new(),
+        avatars_van: std::sync::Weak::new(),
+        paden_index,
+        wordle: Wordle::nieuw(&data_dir),
+        wordle_aankondigen: false,
+        gebruik: Gebruik::nieuw(&data_dir),
+        overzicht: Arc::new(gebruik::Overzicht::default()),
+        overzicht_van: None,
+        bereik: None,
+        eigen_adressen: Vec::new(),
+        uitnodiging: String::new(),
+        codes_uitslag: None,
+        updates: Updates::new(),
+        updates_dir,
+        file_tx,
+        file_rx,
+        kijker_tx,
+        kijker_rx,
+        fout: None,
+        niet_storen: false,
+        clips: clips_beheer,
+        clip_hotkey_verzender,
+        clip_hotkey_ontvanger,
+        clip_aangeboden: None,
+        clip_kaart: None,
+        typing_tot: HashMap::new(),
+        typing_verzonden: HashMap::new(),
+        peer_status: HashMap::new(),
+        eigen_status: UserStatusValue::ONLINE,
+        speelt_zoeker: crate::speelt::Zoeker::default(),
+        speelt_rust: crate::speelt::Rust::default(),
+        speelt_gemeten: None,
+        peer_activiteit: HashMap::new(),
+        peer_voice: HashMap::new(),
+        snap_tx,
+        voorgrond: voorgrond.clone(),
+        afsluiten_voor_update: afsluiten_voor_update.clone(),
+        stil: false,
+    };
+
+    tokio::spawn(engine.run(cmd_rx));
+
+    Ok(EngineHandle {
+        snapshot: snap_rx,
+        commands: cmd_tx,
+        voorgrond,
+        afsluiten_voor_update,
+    })
+}
+
+struct Engine {
+    mesh: MeshHandle,
+    chat: Chat,
+    cfg: Config,
+    config_path: PathBuf,
+    peers: Vec<PeerView>,
+    /// Verbonden peers met het adres waar hun media heen moet.
+    verbonden: HashMap<PeerId, SocketAddr>,
+    voice: Option<VoiceHandle>,
+    /// Peers die gemeld hebben dat ze in het gesprek zitten. Los van of wij meedoen:
+    /// je wilt kunnen zien wie er praat voordat je zelf aansluit.
+    peers_in_voice: HashSet<PeerId>,
+    /// Streams die we al eens vanzelf openden (`Config::auto_popout`). Wie het venster sloot
+    /// wil het na een herverbinding niet terug; een `StreamRevoke` haalt hem eruit.
+    vanzelf_geopend: HashSet<(PeerId, u32)>,
+
+    /// Wie deelt wat en wie kijkt waarnaar. Neemt alle beslissingen; hieronder staat
+    /// alleen het uitvoeren ervan.
+    streams: Streams,
+    /// Pas aangemaakt bij het eerste gebruik: op een machine die nooit deelt of kijkt
+    /// hoeft er geen D3D11-apparaat te bestaan.
+    d3d: Option<D3dContext>,
+    /// De bron per eigen stream. Nodig omdat we de opname pas starten bij de eerste
+    /// kijker, en dan moeten weten wát we ook alweer aankondigden.
+    bronnen: HashMap<u32, Bron>,
+    delers: HashMap<u32, DelerHandle>,
+    kijkers: HashMap<(PeerId, u32), KijkerHandle>,
+    /// De laag met lijnen over een eigen gedeelde monitor, zolang er lijnen staan. Zie
+    /// `werk_deellaag_bij`.
+    deellagen: HashMap<u32, fitcom_video::tekenlaag::Deellaag>,
+    /// Per eigen monitor die nu bediend wordt: de thread die de invoer in het systeem zet
+    /// (beslissing 54). Weg = alles los en klaar.
+    bedieners: HashMap<u32, fitcom_video::bediening::Bediener>,
+    /// Klembordtekst van de deler (deze pc) uit een bedienthread, met het stream-id.
+    bedien_tx: mpsc::UnboundedSender<(u32, String)>,
+    bedien_rx: mpsc::UnboundedReceiver<(u32, String)>,
+    /// Laatste miniatuur per bekeken stream, voor het overzicht in het hoofdvenster.
+    /// Blijft hier staan in plaats van in `Streams`, want dat is pure beslislogica en
+    /// dit is een bijproduct van het decoderen.
+    miniaturen: HashMap<(PeerId, u32), Miniatuur>,
+    /// Volume per bron, ook als de voice-sessie even niet draait. Zo blijft een
+    /// zachtgezette stream zacht als je het gesprek verlaat en weer aansluit.
+    stream_volumes: HashMap<(PeerId, u32), f32>,
+    /// Leest wat Spotify speelt zolang wij hem delen; `None` als we dat niet doen.
+    nu_speelt: Option<crate::muziek::NuSpeelt>,
+
+    /// Wie wat aanbiedt en waar onze eigen downloads staan. Neemt de beslissingen;
+    /// het lezen/schrijven/hashen zelf gebeurt in losse tokio-taken hieronder.
+    files: Files,
+    downloads_dir: PathBuf,
+    /// Content-adresseerbare map voor afbeeldingen: `<hash-hex>.<ext>`, zowel voor wat
+    /// wij aanbieden als voor wat we downloaden. Zie `files::hash_bestandsnaam`.
+    pictures_dir: PathBuf,
+    /// Waar de profielfoto's uit de log op schijf komen (`<data>/avatars`), en wat er nu
+    /// staat. Alleen opnieuw bekeken als de tijdlijn een nieuwe `Arc` is.
+    avatar_dir: PathBuf,
+    avatars: HashMap<PeerId, PathBuf>,
+    /// Een `Weak`, zodat het adres niet hergebruikt kan worden zolang we het vergelijken.
+    avatars_van: std::sync::Weak<Timeline>,
+    /// Waar de padkaarten van `files` op schijf staan. Zie [`PadenIndex`].
+    paden_index: PathBuf,
+    /// Het raadsel van de dag, de eigen gokken en waar dat op schijf staat.
+    /// Zie `crate::wordle`.
+    wordle: Wordle,
+    /// Er is op "zet hem in de chat" gedrukt terwijl het raadsel er nog niet was; zodra
+    /// het binnenkomt gaat de kaart alsnog de log in. Zie `wordle_in_chat`.
+    wordle_aankondigen: bool,
+    /// Gemeten gesprek- en deeltijd per dag, op de eigen schijf. Zie `crate::gebruik`.
+    gebruik: Gebruik,
+    /// De laatst uitgerekende terugblik. Staat hier en niet in `UiState`: hij verandert
+    /// elke seconde, en dan zou hij bij elke tik een `state`-event afdwingen. De UI vraagt
+    /// hem op wanneer het paneel opengaat, net als de tijdlijn.
+    overzicht: Arc<gebruik::Overzicht>,
+    /// Wanneer `overzicht` voor het laatst opnieuw uitgerekend werd; `None` tot de eerste
+    /// keer. Geen `Instant` in het verleden als beginwaarde: op een pc die net opgestart
+    /// is loopt de monotone klok nog geen minuut, en dan paniekt die aftrekking.
+    overzicht_van: Option<Instant>,
+    /// Zie [`Snapshot::bereik`].
+    bereik: Option<fitcom_net::bereik::Bereik>,
+    /// Waar deze pc zichzelf bereikbaar denkt, van de mesh (`MeshEvent::EigenAdressen`).
+    eigen_adressen: Vec<SocketAddr>,
+    /// Zie [`Snapshot::uitnodiging`] en [`Snapshot::codes_uitslag`].
+    uitnodiging: String,
+    codes_uitslag: Option<CodesUitslag>,
+    /// Welke versie de release-feed aanbood en waar we staan met het ophalen daarvan.
+    /// Zie `crate::updates` voor de beslissingen en `crate::release` voor het halen.
+    updates: Updates,
+    /// Waar een opgehaalde nieuwere exe landt, tot toepassing.
+    updates_dir: PathBuf,
+    /// Voor het klonen naar bestandstaken toe; `file_rx` is waar de motor op wacht.
+    file_tx: mpsc::Sender<FileEvent>,
+    file_rx: mpsc::Receiver<FileEvent>,
+    /// Wat de kijkvensters melden. Bewust *niet* op de tik: een keyframe-verzoek dat
+    /// honderd milliseconde blijft liggen is honderd milliseconde bevroren beeld bij de
+    /// kijker, en dat was de helft van de gemeten hapering. Zie `lees_kijker`.
+    kijker_tx: mpsc::UnboundedSender<(PeerId, u32, KijkerEvent)>,
+    kijker_rx: mpsc::UnboundedReceiver<(PeerId, u32, KijkerEvent)>,
+
+    fout: Option<String>,
+    /// Zie `Snapshot::niet_storen`.
+    niet_storen: bool,
+    /// Clipopname-beheer (fase 15). Bestaat altijd; op platforms zonder ondersteuning
+    /// is het een no-op die zichzelf afwezig meldt.
+    clips: crate::clips::ClipsBeheer,
+    /// De geregistreerde clip-hotkey. Vervangen (Drop → WM_QUIT → nieuwe draad) zodra
+    /// de gebruiker een andere toets kiest.
+    hotkey_draad: crate::clips::HotkeyDraad,
+    /// De hotkey-draad praat via dit kanaal naar de motor: één seintje = "bewaar nu",
+    /// dezelfde weg als het ClipseNu-commando.
+    clip_hotkey_verzender: std::sync::mpsc::Sender<()>,
+    clip_hotkey_ontvanger: std::sync::mpsc::Receiver<()>,
+    /// De clip die al als bestandsaanbod de chat in is gegaan (beslissing 44). Eén pad,
+    /// want alleen "de laatste clip" is deelbaar; een nieuwe clip is een ander pad en
+    /// dus weer deelbaar. Bewust niet bewaard over herstarts: na een herstart is er
+    /// geen "laatste clip" meer.
+    clip_aangeboden: Option<PathBuf>,
+    /// De lokale deelkaart van de laatste clip: pad, moment (ms) en grootte, vastgelegd
+    /// op het moment van `Klaar`. Alleen in het geheugen en alleen de laatste.
+    clip_kaart: Option<(PathBuf, i64, u64)>,
+    /// Vluchtige typindicaties: tot wanneer deze peer in dit kanaal aan het typen is.
+    /// Geen oplog, geen doorgifte — na een paar seconden stilte of een verbreking is de
+    /// betekenis weg en mag de administratie dat ook zijn.
+    typing_tot: HashMap<(PeerId, Channel), Instant>,
+    /// Wanneer wij voor het laatst een `Typing` in een kanaal stuurden; throttle zodat
+    /// elke toetsaanslag geen bericht wordt.
+    typing_verzonden: HashMap<Channel, Instant>,
+    /// De gekozen status van elke peer deze sessie. Een peer die nog niets stuurde is
+    /// impliciet online.
+    peer_status: HashMap<PeerId, UserStatusValue>,
+    /// Onze eigen gekozen status. Vluchtig: na een herstart beginnen we weer op online.
+    eigen_status: UserStatusValue,
+    /// "Speelt X" (beslissing 43): de meter, de wisselbewaking, het moment van de laatste
+    /// meting, en wat peers van zichzelf meldden. Alles vluchtig, zoals de status.
+    speelt_zoeker: crate::speelt::Zoeker,
+    speelt_rust: crate::speelt::Rust,
+    speelt_gemeten: Option<Instant>,
+    peer_activiteit: HashMap<PeerId, String>,
+    /// Mute en deafen zoals elke peer in het gesprek ze meldde (`VoiceState`, tag 22). Vluchtig
+    /// en single-hop, net als de status; weg bij verlaten, opnieuw deelnemen en wegvallen.
+    peer_voice: HashMap<PeerId, VoiceState>,
+    snap_tx: watch::Sender<Arc<Snapshot>>,
+    voorgrond: Arc<AtomicBool>,
+    afsluiten_voor_update: Arc<AtomicBool>,
+    /// Het laatste bericht veranderde niets wat het venster toont (invoer van een bediener):
+    /// geen nieuwe momentopname. Anders bouwt de deler er tot ~125 per seconde.
+    stil: bool,
+}
+
+/// Hoe lang een `Typing`-indicatie geldig blijft bij de ontvanger.
+const TYPING_TTL: Duration = Duration::from_secs(5);
+/// Hoe vaak we hooguit een `Typing` versturen tijdens doorlopend typen. Ruim onder de
+/// TTL, zodat één verloren bericht de indicatie niet laat flikkeren.
+const TYPING_THROTTLE: Duration = Duration::from_millis(2500);
+
+/// Wat een bestandstaak (hashen, uploaden, downloaden) terugmeldt aan de motor. Losse
+/// tokio-taken raken schijf en netwerk aan; de motor zelf blijft daar los van, net als
+/// bij de kijker- en delerthreads van screenshare.
+enum FileEvent {
+    /// Hashen/aanbieden van dit pad mislukte; een clip mag dan opnieuw geprobeerd worden.
+    AanbodMislukt {
+        pad: PathBuf,
+    },
+    /// Het lokale bestand is gelezen en gehasht; nu kan het als op vastgelegd worden.
+    NieuwAanbod {
+        pad: PathBuf,
+        naam: String,
+        grootte: u64,
+        hash: [u8; 32],
+        channel: Channel,
+    },
+    Voortgang {
+        file: OpId,
+        ontvangen: u64,
+    },
+    Voltooid {
+        file: OpId,
+        /// Waar het bestand na verificatie is beland. Niet te herleiden uit
+        /// `FileEntry::name`: bij een naambotsing wordt het `naam (2).ext`.
+        pad: PathBuf,
+    },
+    Mislukt {
+        file: OpId,
+        bericht: String,
+    },
+    /// Fase 13: verloop van een check bij de release-feed. Los van `Voortgang`/
+    /// `Voltooid`/`Mislukt` hierboven omdat een update geen `OpId` heeft.
+    ///
+    /// De hele check — feed halen, handtekening controleren, downloaden — is één taak,
+    /// dus dit is puur wat de UI moet weten.
+    UpdateGestart {
+        versie: String,
+        totaal: u64,
+    },
+    UpdateVoortgang {
+        ontvangen: u64,
+    },
+    /// De feed was bereikbaar en had niets nieuwers (of alleen iets weggeklikts).
+    GeenUpdate,
+    UpdateKlaar {
+        pad: PathBuf,
+        /// B-20: de geverifieerde hash reist mee tot aan de updater.
+        hash: [u8; 32],
+    },
+    UpdateMislukt {
+        bericht: String,
+    },
+    /// Het raadsel van vandaag is bij NYT opgehaald (2026-08-20). Zie `crate::wordle` voor
+    /// waarom dat in de motor gebeurt en niet in het venster.
+    WordleGeladen(wordle::Raadsel),
+    /// Een *handmatige* poging is misgegaan; de reden hoort in het venster. Een
+    /// automatische poging meldt niets — zie `wordle_taak`.
+    WordleMislukt(String),
+    /// A0: de routerprobe is klaar (`fitcom_net::bereik`).
+    Bereik(fitcom_net::bereik::Bereik),
+}
+
+impl Engine {
+    async fn run(mut self, mut cmds: mpsc::Receiver<UiCommand>) {
+        // Eigen naam vastleggen in de oplog zodat de anderen hem zien. Doet niets als
+        // hij al klopt, dus de log groeit hier niet van bij elke start.
+        let naam = self.cfg.display_name.clone();
+        let r = self.chat.zet_naam(&naam);
+        self.verwerk(r);
+        self.wordle_inhaalslag();
+        if self.cfg.clips.enabled {
+            self.zet_clips_motor(true);
+        }
+        self.publiceer();
+
+        // A0: één keer meten wat de router doet, alleen lezen (`fitcom_net::bereik`). Niet
+        // meteen: het opstarten heeft dan genoeg te doen. En zo raakt een integratietest,
+        // die korter loopt, de router van de testmachine nooit aan. Was er nog geen router
+        // te vinden (autostart vóór de wifi, of een VPN), dan één keer opnieuw: anders lijkt
+        // die screenshot op een router die niets kan, en op die regel rust de keuze voor fase C.
+        // Met port mapping (B2) meet de mesh dit zelf, live, en meldt het als
+        // `MeshEvent::Bereik`: een tweede, tijdelijke mapping op dezelfde poort zou die van
+        // de mesh bij het vrijgeven meenemen.
+        if !self.cfg.port_mapping {
+            let tx = self.file_tx.clone();
+            let poort = self.cfg.control_port;
+            tokio::spawn(async move {
+                tokio::time::sleep(BEREIK_NA).await;
+                let mut bereik = fitcom_net::bereik::meet(poort).await;
+                if !bereik.gateway {
+                    let _ = tx.send(FileEvent::Bereik(bereik)).await;
+                    tokio::time::sleep(BEREIK_OPNIEUW).await;
+                    bereik = fitcom_net::bereik::meet(poort).await;
+                }
+                let _ = tx.send(FileEvent::Bereik(bereik)).await;
+            });
+        }
+
+        let mut ticker = tokio::time::interval(TIK);
+        let mut update_ticker = tokio::time::interval_at(
+            tokio::time::Instant::now() + UPDATE_EERSTE_CHECK,
+            UPDATE_INTERVAL,
+        );
+
+        loop {
+            tokio::select! {
+                ev = self.mesh.events.recv() => match ev {
+                    Some(ev) => self.op_mesh_event(ev).await,
+                    None => break,
+                },
+                cmd = cmds.recv() => match cmd {
+                    Some(cmd) => self.op_ui_command(cmd),
+                    None => break,
+                },
+                // `None` kan niet gebeuren zolang de motor zelf `file_tx` vasthoudt.
+                ev = self.file_rx.recv() => if let Some(ev) = ev {
+                    self.op_file_event(ev);
+                },
+                // `None` kan niet gebeuren zolang de motor zelf `kijker_tx` vasthoudt.
+                ev = self.kijker_rx.recv() => if let Some((eigenaar, stream_id, ev)) = ev {
+                    self.lees_kijker(eigenaar, stream_id, ev);
+                },
+                // `None` kan niet: de motor houdt `bedien_tx` zelf vast.
+                ev = self.bedien_rx.recv() => if let Some((stream_id, tekst)) = ev {
+                    let cmds = self.streams.klembord_van_deler(stream_id, &tekst);
+                    self.stuur_alles(cmds);
+                },
+                _ = ticker.tick() => {
+                    let verbonden: Vec<PeerId> = self.verbonden.keys().copied().collect();
+                    let r = self.chat.tick(&verbonden);
+                    self.verwerk(r);
+                    self.ruim_gestopte_camera_op();
+                    self.werk_muziektitel_bij();
+                    self.wordle_tick();
+                    self.meet_gebruik();
+                    self.meet_activiteit();
+                    let cmds = self.streams.verlopen_vragen(Instant::now());
+                    self.stuur_alles(cmds);
+                    // Verlopen typindicaties opruimen; de volgende publiceer() merkt
+                    // het alleen als er ook echt iets verdween.
+                    if !self.typing_tot.is_empty() {
+                        let nu = Instant::now();
+                        self.typing_tot.retain(|_, tot| *tot > nu);
+                    }
+                    // Clip-events (klaar/mislukt) binnenhalen en een doodlopende
+                    // keten signaleren. Een klaargekomen clip krijgt hetzelfde
+                    // geluidje als een stream die start — het is ook een "er wordt
+                    // nu iets voor je opgenomen/geleverd"-moment.
+                    if let Some(pad) = self.clips.tik() {
+                        self.geluid(crate::geluid::Geluid::StreamAan);
+                        let at = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map_or(0, |d| d.as_millis() as i64);
+                        let grootte = std::fs::metadata(&pad).map_or(0, |m| m.len());
+                        self.clip_kaart = Some((pad.clone(), at, grootte));
+                        // `Klaar` komt pas na het sluiten van het bestand, dus het is
+                        // compleet. Buiten een gesprek niets: dan is de clip van jou.
+                        if self.cfg.clips.auto_delen && self.voice.is_some() {
+                            self.deel_clip(&pad);
+                        }
+                    }
+                    if let Some(f) = self.clips.fout() {
+                        if self.fout.is_none() {
+                            self.fout = Some(format!("clips: {f}"));
+                        }
+                    }
+                    // Hotkey-seintjes (F9 of wat de gebruiker koos): zelfde pad als
+                    // ClipseNu.
+                    let mut hotkey_aanvragen = 0usize;
+                    while self.clip_hotkey_ontvanger.try_recv().is_ok() {
+                        hotkey_aanvragen += 1;
+                    }
+                    if hotkey_aanvragen > 0 {
+                        tracing::info!(aanvragen = hotkey_aanvragen, "clip-save aangevraagd via de hotkey");
+                        if self.cfg.clips.enabled && self.clips.aan() {
+                            self.clips.bewaar_nu();
+                        } else {
+                            self.fout = Some("Clips staan uit (instellingen → clips).".into());
+                        }
+                    }
+                }
+                _ = update_ticker.tick() => self.zoek_update(false),
+            }
+
+            if std::mem::take(&mut self.stil) {
+                continue;
+            }
+            self.chat.refresh();
+            self.volg_geluid_bij_beeld();
+            self.publiceer();
+        }
+
+        tracing::info!("motor gestopt");
+    }
+
+    // -- mesh --------------------------------------------------------------
+
+    async fn op_mesh_event(&mut self, ev: MeshEvent) {
+        match ev {
+            MeshEvent::Status { target, status } => {
+                let was_online = matches!(
+                    self.peers.get(target).map(|p| &p.status),
+                    Some(PeerStatus::Online { .. })
+                );
+
+                match &status {
+                    PeerStatus::Online {
+                        peer_id,
+                        display_name,
+                        media_addr,
+                        ..
+                    } => {
+                        self.verbonden.insert(*peer_id, *media_addr);
+                        if let Some(p) = self.peers.get_mut(target) {
+                            p.peer_id = Some(*peer_id);
+                            p.label = display_name.clone();
+                        }
+                        if !was_online {
+                            let id = *peer_id;
+                            let r = self.chat.bij_verbinding(id);
+                            self.verwerk(r);
+                            // Zit ik al in het gesprek, dan moet deze peer dat weten;
+                            // hij heeft mijn eerdere melding gemist. Hetzelfde geldt
+                            // voor wat ik deel en voor mijn gekozen status.
+                            if self.voice.is_some() {
+                                self.meld_voice_status(Some(id));
+                            }
+                            if self.eigen_status != UserStatusValue::ONLINE {
+                                self.stuur_alles(vec![MeshCommand::Send {
+                                    to: id,
+                                    msg: ControlMsg::UserStatus(UserStatus {
+                                        status: self.eigen_status,
+                                    }),
+                                }]);
+                            }
+                            if let Some(naam) = self.speelt_rust.huidig().map(str::to_owned) {
+                                self.stuur_alles(vec![MeshCommand::Send {
+                                    to: id,
+                                    msg: ControlMsg::Activity(Activity { name: naam }),
+                                }]);
+                            }
+                            let cmds = self.streams.bij_verbinding(id);
+                            self.stuur_alles(cmds);
+                        }
+                    }
+                    _ => {
+                        if let Some(id) = self.peers.get(target).and_then(|p| p.peer_id) {
+                            self.peer_weg(id);
+                        }
+                    }
+                }
+
+                if let Some(p) = self.peers.get_mut(target) {
+                    p.status = status;
+                }
+                self.werk_voice_peers_bij();
+            }
+
+            MeshEvent::LearnedIdentity {
+                target,
+                peer_id,
+                public_key,
+            } => {
+                if let Some(p) = self.cfg.peers.get_mut(target) {
+                    p.known_id = Some(peer_id);
+                    p.public_key = Some(crate::release::bytes_naar_hex(&public_key));
+                    if let Err(e) = self.cfg.save(&self.config_path) {
+                        self.fout = Some(format!("config opslaan: {e:#}"));
+                    }
+                }
+                if let Some(p) = self.peers.get_mut(target) {
+                    p.peer_id = Some(peer_id);
+                }
+            }
+
+            MeshEvent::Geleerd {
+                peer_id, adressen, ..
+            } => {
+                let pad = self.config_path.with_file_name("adressen.json");
+                if let Err(e) = crate::adressen::bewaar(&pad, peer_id, &adressen) {
+                    tracing::warn!(error = %format!("{e:#}"), "adressen.json niet bijgewerkt");
+                }
+            }
+
+            MeshEvent::Bereik(b) => {
+                tracing::info!(bereik = %b, "bereikbaarheid (port mapping)");
+                self.bereik = Some(b);
+            }
+
+            MeshEvent::EigenAdressen(adressen) => {
+                self.eigen_adressen = adressen;
+                self.werk_uitnodiging_bij();
+            }
+
+            // Een bulkoverdracht, los van de control-stream. Het kind-byte plus (voor een
+            // bestand) de header erachteraan zegt om wat het gaat; `from` is hier niet
+            // nodig om te routeren.
+            MeshEvent::IncomingFileStream { from, stream } => {
+                self.start_incoming_stream(from, stream);
+            }
+
+            MeshEvent::Message { from, msg } => match msg {
+                ControlMsg::VoiceJoin(_) => {
+                    tracing::info!(peer = ?from, "peer neemt deel aan het gesprek");
+                    // Alleen bij een echte overgang: deze melding komt ook langs als
+                    // *wij* net verbinding maken en hij al in het gesprek zat, en dan
+                    // is er niets gebeurd om over te piepen.
+                    if self.peers_in_voice.insert(from) {
+                        self.geluid(geluid::Geluid::PeerJoin);
+                    }
+                    // Een nieuwe sessie begint open; wie gemute is meldt dat direct na de Join,
+                    // over dezelfde geordende verbinding.
+                    self.peer_voice.remove(&from);
+                    self.werk_voice_peers_bij();
+                }
+                ControlMsg::VoiceState(s) => {
+                    self.peer_voice.insert(from, s);
+                }
+                ControlMsg::VoiceLeave(_) => {
+                    tracing::info!(peer = ?from, "peer verlaat het gesprek");
+                    self.peer_voice.remove(&from);
+                    if self.peers_in_voice.remove(&from) {
+                        self.geluid(geluid::Geluid::PeerLeave);
+                    }
+                    self.werk_voice_peers_bij();
+                }
+                ControlMsg::FileRequest(req) => {
+                    let (cmd, upload) = self.files.verzoek_ontvangen(from, &req);
+                    self.stuur_alles(vec![cmd]);
+                    if let Some(actie) = upload {
+                        self.start_upload(actie);
+                    }
+                }
+                ControlMsg::FileResponse(resp) => {
+                    self.files.antwoord_ontvangen(&resp);
+                }
+                ControlMsg::Typing(t) => {
+                    // Een DM-typindicatie hoort alleen van de gesprekspartner zelf te
+                    // komen. Het bericht bewijst wíéér hem stuurde, niet dat hij erin
+                    // zit — dus een kanaal waar wij niet de geadresseerde van zijn
+                    // negeren we hier, net als de op zelf bij ontvangst.
+                    if t.channel.dm_peer().is_some_and(|p| p != self.chat.me()) {
+                        tracing::debug!(peer = ?from, "typindicatie voor een vreemde DM genegeerd");
+                    } else {
+                        // Vluchtig en single-hop: alleen bijhouden, nooit doorsturen.
+                        // De tik ruimt de verlopen entries op, zodat de indicatie ook
+                        // verdwijnt als er daarna geen bericht meer komt.
+                        self.typing_tot
+                            .insert((from, t.channel), Instant::now() + TYPING_TTL);
+                    }
+                }
+                ControlMsg::MusicControl(m) => self.bij_muziekbediening(from, m),
+                ControlMsg::UserStatus(s) => {
+                    if s.status.is_known() {
+                        let was = self.peer_status.insert(from, s.status);
+                        if was != Some(s.status) {
+                            tracing::debug!(peer = ?from, status = %s.status, "status gewijzigd");
+                        }
+                    }
+                }
+                ControlMsg::Activity(a) => {
+                    // De naam komt van een andere PC: dezelfde opschoning als bij ons
+                    // zelf, en nooit langer of anders dan wat we zelf zouden sturen.
+                    match crate::speelt::schoon(&a.name) {
+                        Some(naam) => {
+                            self.peer_activiteit.insert(from, naam);
+                        }
+                        None => {
+                            self.peer_activiteit.remove(&from);
+                        }
+                    }
+                }
+                // Fase 11 duwde exe's tussen peers door; sinds fase 13 komt een update
+                // uit de getekende release-feed en gaat de eigen binary nergens meer
+                // heen (`docs/SECURITY-AUDIT.md` B-01, B-21). De varianten blijven in het
+                // protocol staan — dat wijzigt alleen additief — maar worden hier
+                // geweigerd, ook als de peer een oudere build draait die ze nog stuurt.
+                ControlMsg::UpdateRequest(_) | ControlMsg::UpdateResponse(_) => {
+                    tracing::warn!(
+                        peer = ?from,
+                        "update-bericht van een peer genegeerd; updates komen uit de release-feed"
+                    );
+                }
+                // Tekenen (beslissing 45): alleen de routering in `streams.rs` en de laag of
+                // het kijkvenster bijwerken. Bewust niet door de algemene arm hieronder: die
+                // bouwt per bericht de lijst bekende afbeeldingen op en telt de streams voor
+                // het geluidje, en dit komt ~25 keer per seconde per tekenaar binnen, op de
+                // PC van de deler (invariant 4). Tekenwerk verandert geen stream en geen chat.
+                //
+                // Bedienen (beslissing 54) om dezelfde reden: invoer komt tot ~125 keer per
+                // seconde binnen, op de pc van de deler die misschien zit te gamen.
+                teken @ (ControlMsg::Draw(_)
+                | ControlMsg::DrawClear(_)
+                | ControlMsg::DrawState(_)
+                | ControlMsg::RemoteRequest(_)
+                | ControlMsg::RemoteState(_)
+                | ControlMsg::RemoteInput(_)
+                | ControlMsg::ClipboardText(_)) => {
+                    if let Some(ip) = self.verbonden.get(&from).map(|a| a.ip()) {
+                        let (cmds, acties) = self.streams.bij_bericht(from, ip, &teken);
+                        self.stuur_alles(cmds);
+                        self.voer_uit(acties);
+                    }
+                    self.stil = matches!(teken, ControlMsg::RemoteInput(_));
+                }
+                andere => {
+                    // Screenshare eerst: `bij_bericht` van de chat laat alles wat niet
+                    // van hem is ongemoeid, en andersom net zo.
+                    if let Some(ip) = self.verbonden.get(&from).map(|a| a.ip()) {
+                        // Voor en na tellen in plaats van op het berichttype letten: een
+                        // `StreamAnnounce` komt bij elke herverbinding opnieuw langs voor
+                        // een stream die we al kenden, en daar hoort geen geluidje bij.
+                        let voor = self.zichtbare_streams_van(from);
+                        let nieuw_scherm = match &andere {
+                            ControlMsg::StreamAnnounce(a)
+                                if a.kind.is_scherm() && !self.streams.kent(from, a.stream_id) =>
+                            {
+                                Some(a.stream_id)
+                            }
+                            _ => None,
+                        };
+                        let (cmds, acties) = self.streams.bij_bericht(from, ip, &andere);
+                        self.stuur_alles(cmds);
+                        self.voer_uit(acties);
+                        match self.zichtbare_streams_van(from).cmp(&voor) {
+                            std::cmp::Ordering::Greater => self.geluid(geluid::Geluid::StreamAan),
+                            std::cmp::Ordering::Less => self.geluid(geluid::Geluid::StreamUit),
+                            std::cmp::Ordering::Equal => {}
+                        }
+                        if let Some(id) = nieuw_scherm {
+                            self.klap_uit(from, id);
+                        }
+                        // Gestopt is gestopt: stream-id's tellen per proces vanaf 1, dus na een
+                        // herstart van de deler is "dezelfde" id een nieuw scherm.
+                        if let ControlMsg::StreamRevoke(r) = &andere {
+                            self.vanzelf_geopend.remove(&(from, r.stream_id));
+                        }
+                    }
+
+                    // Alleen een live `OpBroadcast` van een `Post` komt in aanmerking
+                    // voor een melding. Een `SyncResponse` is per definitie een
+                    // inhaalslag van gemiste geschiedenis (zie docs/ARCHITECTURE.md) en
+                    // meldt daarom nooit, ongeacht de inhoud — dat onderscheid zit al
+                    // in het berichttype, dus zonder aparte "sync klaar"-status.
+                    let live_post = match &andere {
+                        ControlMsg::OpBroadcast(b) => match b.op.kind() {
+                            Ok(Some(OpKind::Post { body, .. })) => Some((b.op.channel, body)),
+                            _ => None,
+                        },
+                        _ => None,
+                    };
+                    let voor_alg = self.chat.ongelezen;
+                    let voor_dm = self.chat.ongelezen_dm().get(&from).copied().unwrap_or(0);
+                    let voor_topic = live_post
+                        .as_ref()
+                        .and_then(|(c, _)| c.topic_id())
+                        .map(|t| self.chat.ongelezen_topic().get(&t).copied().unwrap_or(0));
+
+                    // Vóór `bij_bericht`: welke afbeeldingen kennen we al, zodat we straks
+                    // alleen de écht nieuwe kunnen herkennen (zie de auto-download hieronder).
+                    let bekende_afbeeldingen: HashSet<OpId> = self
+                        .chat
+                        .timeline()
+                        .files
+                        .iter()
+                        .filter(|f| files::is_afbeelding(&f.name))
+                        .map(|f| f.id)
+                        .collect();
+
+                    let r = self.chat.bij_bericht(from, andere);
+                    self.verwerk(r);
+                    // Nieuwe bestanden zitten pas in de timeline ná een refresh — die
+                    // gebeurt normaal aan het eind van de hoofdlus, maar de auto-download
+                    // hieronder heeft de bijgewerkte lijst nu al nodig.
+                    self.chat.refresh();
+
+                    if let Some((channel, body)) = live_post {
+                        // Pas ná `bij_bericht` weten we of dit echt nieuw was: een
+                        // dubbel bezorgde broadcast mag geen tweede melding geven.
+                        let nieuw = if let Some(topic) = channel.topic_id() {
+                            self.chat
+                                .ongelezen_topic()
+                                .get(&topic)
+                                .copied()
+                                .unwrap_or(0)
+                                > voor_topic.unwrap_or(0)
+                        } else if channel.is_general() {
+                            self.chat.ongelezen > voor_alg
+                        } else {
+                            self.chat.ongelezen_dm().get(&from).copied().unwrap_or(0) > voor_dm
+                        };
+                        if nieuw {
+                            self.overweeg_melding(from, &body);
+                        }
+                    }
+
+                    // Afbeeldingen downloaden zichzelf automatisch, voor iedereen — live
+                    // binnengekomen én ingehaald bij (her)verbinding. Andere bestanden
+                    // blijven achter de bevestigingswal (de downloadknop) staan, precies
+                    // zoals dat al was. Eigen aanbod slaan we over: dat staat al op schijf
+                    // via `hash_en_bied_aan`, en downloaden zou alleen jezelf aanvragen.
+                    let me = self.chat.me();
+                    let nieuwe_afbeeldingen: Vec<OpId> = self
+                        .chat
+                        .timeline()
+                        .files
+                        .iter()
+                        .filter(|f| {
+                            f.author != me
+                                && !bekende_afbeeldingen.contains(&f.id)
+                                && files::is_afbeelding(&f.name)
+                                // B-22: alleen automatisch ophalen onder een plafond. Dit is
+                                // het enige pad waarop bytes zonder één klik binnenkomen —
+                                // een afbeelding haalt en toont zichzelf, live én bij het
+                                // inhalen van geschiedenis. Zonder grens is dat een
+                                // download-DoS met een `size` die niemand controleert.
+                                // Boven het plafond blijft het bestand gewoon aanklikbaar;
+                                // het gaat er alleen niet meer vanzelf achteraan.
+                                && f.size <= MAX_AUTO_AFBEELDING
+                        })
+                        .map(|f| f.id)
+                        .collect();
+                    for id in nieuwe_afbeeldingen {
+                        if self.files.status(id).is_none() {
+                            self.download_bestand(id);
+                        }
+                    }
+                }
+            },
+        }
+    }
+
+    // -- updates (fase 13) --------------------------------------------------
+
+    /// Kijkt bij de release-feed of er een nieuwere, getekende versie klaarstaat, en haalt
+    /// hem meteen op als dat zo is. Eén taak voor het hele traject: de motor houdt geen
+    /// halve toestand vast tussen "feed gelezen" en "bytes binnen".
+    /// `handmatig` is een druk op "Check for updates". Dan hoort elke uitkomst zichtbaar
+    /// te worden; de periodieke tik blijft stil zolang er niets te melden is, want
+    /// offline is een normale toestand en niet iets om over te berichten.
+    fn zoek_update(&mut self, handmatig: bool) {
+        // Op macOS is er geen updater: `fitcom-updater` is daar een lege stub, dus een
+        // opgehaalde build zou nergens heen kunnen. De mac bouwt uit de broncode;
+        // versies blijven per werkafspraak gelijk op. Zie docs/ARCHITECTURE.md (mac-port).
+        if cfg!(target_os = "macos") {
+            if handmatig {
+                self.updates.mislukt(
+                    "op macOS werkt bijwerken niet vanzelf; deze build komt uit de broncode".into(),
+                );
+            }
+            return;
+        }
+        if !self.updates.mag_zoeken() {
+            return;
+        }
+        self.updates.zoeken_gestart(handmatig);
+        tokio::spawn(update_check_taak(
+            self.updates_dir.clone(),
+            self.updates.genegeerde_versies(),
+            handmatig,
+            self.file_tx.clone(),
+        ));
+    }
+
+    /// Het updater-proces naast de app, of niets.
+    ///
+    /// De naam mag afwijken. Een browser die hetzelfde bestand twee keer binnenhaalt maakt
+    /// er `fitcom-updater (1).exe` van, en dan stond de app te wachten op een bestand dat
+    /// er in de ogen van de gebruiker gewoon stond. Alles wat in de map van de app met
+    /// `fitcom-updater` begint en op `.exe` eindigt telt daarom mee — die map is dezelfde
+    /// vertrouwensgrens als `fitcom.exe` zelf.
+    fn zoek_updater(verwacht: &std::path::Path) -> Option<PathBuf> {
+        if verwacht.exists() {
+            return Some(verwacht.to_path_buf());
+        }
+        let mut kandidaten: Vec<PathBuf> = std::fs::read_dir(verwacht.parent()?)
+            .ok()?
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                let naam = p
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or_default()
+                    .to_ascii_lowercase();
+                naam.starts_with("fitcom-updater") && naam.ends_with(".exe")
+            })
+            .collect();
+        // Vast op naam, zodat twee kopieën niet per toeval om en om gekozen worden.
+        kandidaten.sort();
+        if let Some(p) = kandidaten.first() {
+            tracing::warn!(pad = %p.display(), "updater onder een afwijkende naam gevonden");
+        }
+        kandidaten.into_iter().next()
+    }
+
+    /// De gebruiker bevestigt "nu bijwerken en herstarten": start het losse
+    /// updater-proces (dat wacht tot wíj afgesloten zijn, want een exe kan zichzelf niet
+    /// overschrijven terwijl hij draait) en sluit daarna net zo af als via het tray-menu.
+    fn pas_update_toe(&mut self) {
+        let Some(UpdateStatus::KlaarOmToeTePassen { pad, hash, .. }) =
+            self.updates.status().cloned()
+        else {
+            return;
+        };
+        let huidige_exe = match std::env::current_exe() {
+            Ok(p) => p,
+            Err(e) => {
+                self.fout = Some(format!("eigen exe-pad niet te bepalen: {e}"));
+                return;
+            }
+        };
+        // Naast de hoofd-exe, net als bij een gewone build (zie `crates/app/src/bin/fitcom-updater.rs`).
+        let verwacht = huidige_exe.with_file_name("fitcom-updater.exe");
+        // Zonder dit is de melding "updater starten mislukt: Het systeem kan het
+        // opgegeven bestand niet vinden" — waar niemand uit opmaakt dat er een tweede
+        // bestand naast fitcom.exe uit de zip hoort.
+        let Some(updater) = Self::zoek_updater(&verwacht) else {
+            let bericht = format!(
+                "fitcom-updater.exe staat niet naast fitcom.exe ({}). \
+                 Pak hem uit de release naast de app; zonder hem kan een draaiende exe \
+                 zichzelf niet vervangen.",
+                verwacht.display()
+            );
+            tracing::error!(pad = %verwacht.display(), "updater ontbreekt");
+            self.fout = Some(bericht);
+            return;
+        };
+        // B-20: de hash gaat mee, zodat de updater hem opnieuw legt vlak vóór het
+        // overschrijven. Hier verifiëren zou niets toevoegen — tussen hier en `vervang()`
+        // zit precies hetzelfde gat.
+        let resultaat = std::process::Command::new(&updater)
+            .arg("--new")
+            .arg(&pad)
+            .arg("--target")
+            .arg(&huidige_exe)
+            .arg("--pid")
+            .arg(std::process::id().to_string())
+            .arg("--hash")
+            .arg(release::bytes_naar_hex(&hash))
+            .spawn();
+        let mut kind = match resultaat {
+            Ok(k) => k,
+            Err(e) => {
+                tracing::error!(error = %e, pad = %updater.display(), "updater niet te starten");
+                self.fout = Some(format!("updater starten mislukt: {e}"));
+                return;
+            }
+        };
+        // Een geslaagde `spawn()` zegt alleen dat het proces bestónd, niet dat het leeft.
+        // Op 2026-08-20 viel de updater van v1.2.4 die nog naast de app stond meteen om op
+        // het nieuwe `--hash` (exitcode 2, vóór zijn eerste logregel, en zonder console
+        // omdat hij een GUI-binary is). Wij zagen alleen "gelukt", sloten het venster, en
+        // niemand verving iets: de app was weg, de update niet uitgevoerd, geen enkele
+        // aanwijzing waarom. Zolang de updater leeft blokkeert hij op ons PID, dus een
+        // proces dat binnen deze tijd al weg is, is per definitie stuk.
+        //
+        // ponytail: 300 ms slapen op de UI-draad; dit is de klik "nu bijwerken en
+        // herstarten" en we sluiten hierna toch af. Een wachtdraad met terugkoppeling
+        // pas als er ooit iets anders na deze plek moet gebeuren.
+        std::thread::sleep(Duration::from_millis(300));
+        match kind.try_wait() {
+            Ok(None) => self.afsluiten_voor_update.store(true, Ordering::Relaxed),
+            Ok(Some(status)) => {
+                tracing::error!(
+                    %status,
+                    pad = %updater.display(),
+                    "updater stopte meteen; er wordt niets vervangen"
+                );
+                self.fout = Some(format!(
+                    "de updater stopte meteen ({status}) en heeft niets vervangen. \
+                     Meestal staat er dan een oude fitcom-updater.exe naast de app: \
+                     haal hem uit de nieuwste release en zet hem naast fitcom.exe. \
+                     Zie ook updater.log in die map."
+                ));
+            }
+            // Niet te bepalen — dan liever doorgaan zoals hiervoor dan een werkende
+            // update tegenhouden op een vraag die we niet beantwoord krijgen.
+            Err(e) => {
+                tracing::warn!(error = %e, "updater-status niet op te vragen; toch afsluiten");
+                self.afsluiten_voor_update.store(true, Ordering::Relaxed);
+            }
+        }
+    }
+
+    // -- voice -------------------------------------------------------------
+
+    fn deelnemen(&mut self) {
+        if self.voice.is_some() {
+            return;
+        }
+        let cfg = VoiceConfig {
+            input_device: self.cfg.input_device.clone(),
+            output_device: self.cfg.output_device.clone(),
+            post: self.mesh.post.clone(),
+        };
+        match fitcom_audio::start(cfg) {
+            Ok(h) => {
+                // Een nieuwe sessie begint op 100% voor iedereen. Wat de gebruiker per
+                // peer en per stream instelde (ook iemand lokaal dempen, volume 0) staat
+                // hier in de motor en moet er dus opnieuw in, anders toont de UI 30% en
+                // hoor je na opnieuw joinen of een apparaatwissel weer 100%.
+                for p in &self.peers {
+                    if let Some(id) = p.peer_id {
+                        h.zet_volume(id, p.volume);
+                    }
+                }
+                for (&bron, &vol) in &self.stream_volumes {
+                    h.zet_bron_volume(bron, vol);
+                }
+                let (modus, vk) = self.cfg.push_to_talk.voor_audio();
+                h.zet_spreektoets(modus, vk);
+                self.voice = Some(h);
+                self.geluid(geluid::Geluid::EigenJoin);
+                self.werk_voice_peers_bij();
+                self.meld_voice_status(None);
+                // Deelde je al een scherm vóór je het gesprek in kwam, dan hoort het
+                // geluid er nu alsnog automatisch bij (fase 10).
+                if self.deelt_scherm_of_venster() {
+                    self.deel_bureaubladgeluid();
+                }
+            }
+            Err(e) => {
+                tracing::error!(error = %format!("{e:#}"), "voice starten mislukt");
+                self.fout = Some(format!("microfoon of weergave: {e:#}"));
+            }
+        }
+    }
+
+    fn verlaten(&mut self) {
+        if self.voice.take().is_none() {
+            return;
+        }
+        self.geluid(geluid::Geluid::EigenLeave);
+        self.meld_voice_status(None);
+
+        // Bureaubladgeluid en muziek lopen over de voice-socket, en die is er nu niet
+        // meer. Zowel wat we deelden als waar we naar luisterden moet daarom weg — anders
+        // blijven de anderen naar een dood adres sturen en denkt de UI dat het werkt.
+        let eigen: Vec<u32> = self
+            .streams
+            .eigen()
+            .iter()
+            .filter(|s| s.kind.is_geluid())
+            .map(|s| s.id)
+            .collect();
+        for id in eigen {
+            let (cmds, acties) = self.streams.stop_delen(id);
+            self.stuur_alles(cmds);
+            self.voer_uit(acties);
+        }
+        self.nu_speelt = None;
+
+        let geluid: Vec<(PeerId, u32)> = self
+            .streams
+            .vreemd()
+            .iter()
+            .filter(|s| s.kijken && s.kind.is_geluid())
+            .map(|s| (s.eigenaar, s.id))
+            .collect();
+        for (eigenaar, id) in geluid {
+            let (cmds, acties) = self.streams.stop_kijken(eigenaar, id);
+            self.stuur_alles(cmds);
+            self.voer_uit(acties);
+        }
+    }
+
+    /// `naar = None` betekent: iedereen.
+    fn meld_voice_status(&mut self, naar: Option<PeerId>) {
+        let msg = if self.voice.is_some() {
+            ControlMsg::VoiceJoin(VoiceJoin {
+                media_port: self.mesh.post.poort(),
+            })
+        } else {
+            ControlMsg::VoiceLeave(VoiceLeave {})
+        };
+        let cmd = match naar {
+            Some(to) => MeshCommand::Send { to, msg },
+            None => MeshCommand::Broadcast(msg),
+        };
+        if let Err(e) = self.mesh.commands.try_send(cmd) {
+            tracing::warn!(error = %e, "voice-status niet verstuurd");
+        }
+        // Na de Join, die bij de ander de vorige mute wist. Open is de stand na een Join.
+        if self
+            .voice
+            .as_ref()
+            .is_some_and(|v| v.is_mute() || v.is_deafen())
+        {
+            self.meld_mute(naar);
+        }
+    }
+
+    /// Mute en deafen naar de anderen in het gesprek, zodat hun lijst het laat zien.
+    /// `naar = None` betekent: iedereen.
+    fn meld_mute(&mut self, naar: Option<PeerId>) {
+        let Some(v) = &self.voice else { return };
+        let msg = ControlMsg::VoiceState(VoiceState {
+            muted: v.is_mute(),
+            deafened: v.is_deafen(),
+        });
+        let cmd = match naar {
+            Some(to) => MeshCommand::Send { to, msg },
+            None => MeshCommand::Broadcast(msg),
+        };
+        if let Err(e) = self.mesh.commands.try_send(cmd) {
+            tracing::warn!(error = %e, "mute-status niet verstuurd");
+        }
+    }
+
+    /// Alleen peers die én verbonden zijn én meedoen krijgen onze audio.
+    fn werk_voice_peers_bij(&mut self) {
+        let Some(voice) = &self.voice else { return };
+        let doelen: Vec<PeerAdres> = self
+            .peers_in_voice
+            .iter()
+            .filter_map(|id| {
+                self.verbonden.get(id).map(|addr| PeerAdres {
+                    id: *id,
+                    addr: *addr,
+                })
+            })
+            .collect();
+        tracing::debug!(aantal = doelen.len(), "voice-deelnemers bijgewerkt");
+        voice.zet_peers(doelen);
+    }
+
+    // -- screenshare -------------------------------------------------------
+
+    /// Het D3D11-apparaat, aangemaakt bij het eerste gebruik. Deelt en kijkt hetzelfde
+    /// apparaat, zodat een textuur nergens tussen apparaten hoeft te reizen.
+    fn d3d(&mut self) -> Result<D3dContext> {
+        if let Some(d) = &self.d3d {
+            return Ok(d.clone());
+        }
+        let d = D3dContext::new().context("grafische kaart openen")?;
+        self.d3d = Some(d.clone());
+        Ok(d)
+    }
+
+    fn codec(&self) -> Codec {
+        Codec::van_naam(&self.cfg.video.codec).unwrap_or_else(|| {
+            tracing::warn!(gekozen = %self.cfg.video.codec, "onbekende codec in de config; h264 gebruikt");
+            Codec::H264
+        })
+    }
+
+    /// Of deze eigen stream een deler verdient zónder kijkers — dat is precies de camera,
+    /// want daar ben jij de kijker: de deler bestaat zolang de camera aan staat. Een scherm
+    /// wordt pas opgenomen als er iemand kijkt (invariant 4), dus zijn deler gaat weg met
+    /// de laatste kijker.
+    ///
+    /// De terugblik zelf (de tegel in de streamstrook) levert elke deler, ook een scherm;
+    /// dit gaat alleen over de levensduur.
+    fn heeft_voorbeeld(&self, stream_id: u32) -> bool {
+        self.streams
+            .eigen()
+            .iter()
+            .any(|s| s.id == stream_id && s.kind == StreamKind::CAMERA)
+    }
+
+    /// Zet de camera uit als zijn deler er niet meer is.
+    ///
+    /// Nodig sinds de opname bij het *aanzetten* begint in plaats van bij de eerste kijker
+    /// (beslissing 26): vanaf dat moment kan het aanzetten zelf mislukken — de camera is in
+    /// gebruik door Teams, de encoder wil niet — en dat is iets waar de gebruiker op staat
+    /// te wachten. De deler heeft geen kanaal terug naar de motor, dus hij legt zijn reden
+    /// neer en die wordt hier op de tik opgehaald.
+    ///
+    /// Alleen voor een camera. Een gedeeld scherm heeft geen terugblik en hoort niet
+    /// vanzelf te verdwijnen omdat een deler eruit klapte; daar blijft de aankondiging
+    /// staan en probeert de volgende kijker het opnieuw, zoals altijd.
+    /// Zet de clipopname aan of uit, zonder de config aan te raken — de commando-arm
+    /// beslist of dat meegaat naar `config.toml`. Bij het aanzetten wordt hier pas een
+    /// D3D-context geopend: een machine die nooit clips gebruikt hoeft hem niet.
+    fn zet_clips_motor(&mut self, aan: bool) {
+        let d3d = if aan {
+            match self.d3d() {
+                Ok(d) => Some(d),
+                Err(e) => {
+                    self.fout = Some(format!("clips: {e:#}"));
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+        if let Err(e) = self.clips.zet(
+            aan,
+            &self.cfg.clips,
+            self.cfg.input_device.as_deref(),
+            d3d.as_ref(),
+        ) {
+            tracing::error!(error = %format!("{e:#}"), "clipopname wisselen mislukt");
+            self.fout = Some(format!("clips: {e:#}"));
+        }
+    }
+
+    fn ruim_gestopte_camera_op(&mut self) {
+        let dood: Vec<(u32, Option<String>)> = self
+            .streams
+            .eigen()
+            .iter()
+            .filter(|s| s.kind == StreamKind::CAMERA)
+            .filter_map(|s| {
+                let d = self.delers.get(&s.id)?;
+                d.gestopt().then(|| (s.id, d.fout()))
+            })
+            .collect();
+
+        for (id, fout) in dood {
+            match fout {
+                Some(f) => {
+                    tracing::warn!(stream = id, error = %f, "camera gestopt door een fout");
+                    self.fout = Some(format!("camera: {f}"));
+                }
+                None => tracing::info!(stream = id, "camera uit; de deler was al gestopt"),
+            }
+            self.stop_met_delen(id);
+        }
+    }
+
+    /// Een bron aankondigen. Er wordt nog niets opgenomen — dat is het hele punt.
+    ///
+    /// Levert het toegekende stream-id op, zodat de aanroeper er nog iets mee kan (de
+    /// camera begint meteen op te nemen voor zijn eigen terugblik). `None` als het niet
+    /// lukte.
+    fn deel_bron(&mut self, bron: Bron, opties: DeelOpties) -> Option<u32> {
+        let afmeting = match fitcom_video::capture::afmeting_van(&bron) {
+            Ok(a) => a,
+            Err(e) => {
+                tracing::error!(error = %format!("{e:#}"), "bron niet te openen");
+                self.fout = Some(format!("bron niet te openen: {e:#}"));
+                return None;
+            }
+        };
+
+        let kind = match bron.soort {
+            BronSoort::Monitor => StreamKind::MONITOR,
+            BronSoort::Venster => StreamKind::WINDOW,
+            BronSoort::Camera => StreamKind::CAMERA,
+        };
+        // Bedienen alleen op een monitor en niet op macOS (beslissing 54); `Streams::deel`
+        // bewaakt de monitor nog eens.
+        let opties = DeelOpties {
+            bedienen: opties.bedienen && BEDIENEN_KAN,
+            ..opties
+        };
+        let (id, cmds) = self
+            .streams
+            .deel(kind, bron.naam.clone(), afmeting.0, afmeting.1, opties);
+        self.bronnen.insert(id, bron);
+        self.stuur_alles(cmds);
+
+        // Fase 10: geen losse knop meer, geluid van deze pc gaat automatisch mee zodra
+        // er iets gedeeld wordt. `deel_bureaubladgeluid` is zelf al idempotent, dus dit
+        // mag ook als er al een tweede scherm bij komt.
+        //
+        // Een camera valt er buiten: die deelt geen systeemgeluid, en je webcam aanzetten
+        // hoort niet stilzwijgend je Spotify de kamer in te sturen.
+        if kind.is_scherm() {
+            self.deel_bureaubladgeluid();
+        }
+        Some(id)
+    }
+
+    /// Of we op dit moment een monitor of venster delen — dus of bureaubladgeluid mee
+    /// hoort te lopen. Een camera telt niet mee.
+    fn deelt_scherm_of_venster(&self) -> bool {
+        self.streams.eigen().iter().any(|s| s.kind.is_scherm())
+    }
+
+    /// Stoppen met delen. Eén plek, want zowel de knop "stop met delen", de camera-knop
+    /// als het intrekken bij een fout komen hier langs — en het opruimen van
+    /// bureaubladgeluid mag geen van die drie overslaan.
+    fn stop_met_delen(&mut self, id: u32) {
+        let was_scherm = self
+            .bronnen
+            .remove(&id)
+            .is_some_and(|b| b.soort != BronSoort::Camera);
+        let (cmds, acties) = self.streams.stop_delen(id);
+        self.stuur_alles(cmds);
+        self.voer_uit(acties);
+        // Expliciet, niet via `Actie::StopDelen`: die komt er alleen als er iemand kéék,
+        // en een camera met een terugblik loopt ook zonder kijkers. Dit sluit dus de
+        // opname zelf. Een no-op voor alles wat geen deler had.
+        self.delers.remove(&id);
+        // Fase 10: het laatste scherm weg betekent ook het geluid weg, zonder dat de
+        // gebruiker dat apart hoeft te doen. Een camera heeft er niets mee te maken.
+        if was_scherm && !self.deelt_scherm_of_venster() {
+            self.stop_bureaubladgeluid();
+        }
+    }
+
+    /// De camera aan- of uitzetten, als één schakelaar voor de UI.
+    ///
+    /// Aanzetten kondigt de eerste camera van deze machine aan als gewone stream — er
+    /// wordt nog niets opgenomen en het lampje blijft uit tot iemand er echt naar kijkt,
+    /// net als bij een gedeeld scherm. Idempotent: al in de gevraagde stand is een no-op,
+    /// zodat twee snelle klikken geen tweede camerastream opleveren.
+    fn zet_camera(&mut self, aan: bool) {
+        let eigen = self
+            .streams
+            .eigen()
+            .iter()
+            .find(|s| s.kind == StreamKind::CAMERA)
+            .map(|s| s.id);
+
+        match (aan, eigen) {
+            (true, None) => {
+                let bronnen = match deelbare_bronnen() {
+                    Ok(b) => b,
+                    Err(e) => {
+                        tracing::error!(error = %format!("{e:#}"), "camera's niet op te vragen");
+                        self.fout = Some(format!("camera: {e:#}"));
+                        return;
+                    }
+                };
+                match bronnen.into_iter().find(|b| b.soort == BronSoort::Camera) {
+                    Some(camera) => {
+                        // Anders dan bij een scherm gaat de opname hier meteen aan: het
+                        // jezelf terugzien is de reden dat je de camera aanzet, en zonder
+                        // opname is er niets te zien. Het lampje gaat dus aan zodra je
+                        // hem aanzet — dat is precies wat "ik wil mezelf zien" betekent.
+                        if let Some(id) = self.deel_bron(camera, DeelOpties::default()) {
+                            if let Err(e) = self.start_deler(id, Vec::new()) {
+                                tracing::error!(error = %format!("{e:#}"), "camera starten mislukt");
+                                self.fout = Some(format!("camera: {e:#}"));
+                                // Niet half aan laten staan: de aankondiging weer intrekken.
+                                self.stop_met_delen(id);
+                            }
+                        }
+                    }
+                    None => {
+                        self.fout = Some(
+                            "geen camera gevonden; zit hij erin en gebruikt iets anders hem niet?"
+                                .into(),
+                        );
+                    }
+                }
+            }
+            (false, Some(id)) => self.stop_met_delen(id),
+            _ => {}
+        }
+    }
+
+    /// Onze muziekstream, als we Spotify delen.
+    fn eigen_muziek(&self) -> Option<u32> {
+        self.streams
+            .eigen()
+            .iter()
+            .find(|s| s.kind == StreamKind::MUSIC)
+            .map(|s| s.id)
+    }
+
+    /// Spotify delen of ermee stoppen.
+    ///
+    /// Net als een scherm wordt er pas opgenomen als iemand luistert — maar bij muziek
+    /// tekent iedereen in het gesprek vanzelf in (`Streams::stem_geluid_af_op_beeld`), dus
+    /// in de praktijk meteen. Alleen Spotify, niet je spel of je stem: de proces-loopback
+    /// pakt alleen zijn procesboom (`fitcom_audio::spotify`).
+    ///
+    /// Bureaubladgeluid gaat zolang uit. Dat bevat Spotify ook, dus wie je scherm bekijkt
+    /// zou de muziek anders twee keer horen, net niet gelijk.
+    fn zet_spotify(&mut self, aan: bool) {
+        match (aan, self.eigen_muziek()) {
+            (true, None) => {
+                if self.voice.is_none() {
+                    self.fout = Some("Spotify delen: neem eerst deel aan het gesprek".into());
+                    return;
+                }
+                if fitcom_audio::spotify::pid().is_none() {
+                    self.fout = Some(
+                        "Spotify draait niet; open de Spotify-app en probeer het opnieuw".into(),
+                    );
+                    return;
+                }
+                self.stop_bureaubladgeluid();
+                let (_, cmds) = self.streams.deel(
+                    StreamKind::MUSIC,
+                    "Spotify".into(),
+                    0,
+                    0,
+                    DeelOpties::default(),
+                );
+                self.stuur_alles(cmds);
+                self.nu_speelt = Some(crate::muziek::NuSpeelt::start());
+                self.werk_muziektitel_bij();
+            }
+            (false, Some(id)) => {
+                let (cmds, acties) = self.streams.stop_delen(id);
+                self.stuur_alles(cmds);
+                self.voer_uit(acties);
+                self.nu_speelt = None;
+                if self.deelt_scherm_of_venster() {
+                    self.deel_bureaubladgeluid();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Een luisteraar drukt op pauze of volgende (beslissing 41). Iedereen in het gesprek
+    /// mag dat meteen, zonder stemming; wie er niet in zit niet — die hoort de muziek ook
+    /// niet. En alleen voor de stream die we nú delen, zodat een late klik na opnieuw
+    /// delen niets doet. Geen antwoord: wat de luisteraar terugziet is de nieuwe titel.
+    fn bij_muziekbediening(&mut self, van: PeerId, m: MusicControl) {
+        let mag = mag_muziek_bedienen(
+            self.eigen_muziek(),
+            self.voice.is_some(),
+            self.peers_in_voice.contains(&van),
+            &m,
+        );
+        if !mag {
+            tracing::debug!(peer = ?van, actie = ?m.action, "muziekbediening genegeerd");
+            return;
+        }
+        tracing::info!(peer = ?van, actie = ?m.action, "luisteraar bedient de muziek");
+        crate::muziek::bedien(m.action);
+    }
+
+    /// Het nummer dat nu speelt als titel van onze muziekstream. Elke tik gevraagd; er
+    /// gaat alleen iets de draad op als het nummer echt wisselde.
+    fn werk_muziektitel_bij(&mut self) {
+        let (Some(nu), Some(id)) = (&self.nu_speelt, self.eigen_muziek()) else {
+            return;
+        };
+        let titel = nu.titel().unwrap_or_else(|| "Spotify".into());
+        let cmds = self.streams.zet_titel(id, &titel);
+        self.stuur_alles(cmds);
+    }
+
+    /// Stopt bureaubladgeluid omdat het laatste gedeelde scherm net gestopt is. Geen-op
+    /// als er toch niets gedeeld wordt.
+    fn stop_bureaubladgeluid(&mut self) {
+        let Some(id) = self
+            .streams
+            .eigen()
+            .iter()
+            .find(|s| s.kind == StreamKind::DESKTOP_AUDIO)
+            .map(|s| s.id)
+        else {
+            return;
+        };
+        let (cmds, acties) = self.streams.stop_delen(id);
+        self.stuur_alles(cmds);
+        self.voer_uit(acties);
+    }
+
+    /// Of dit een van onze streams is die geluid draagt in plaats van beeld.
+    ///
+    /// `Actie` zegt dat niet zelf: het is een eigenschap van de stream, niet van de
+    /// beslissing, en die staat al in `streams`.
+    fn is_geluid(&self, stream_id: u32) -> bool {
+        self.streams
+            .eigen()
+            .iter()
+            .any(|s| s.id == stream_id && s.kind.is_geluid())
+    }
+
+    /// Het geluid van deze PC aankondigen. Net als bij een scherm wordt er nog niets
+    /// opgenomen: dat begint pas als er iemand meeluistert. Automatisch aangeroepen
+    /// (fase 10), dus geen gesprek is normaal en geen fout — gewoon niets doen.
+    fn deel_bureaubladgeluid(&mut self) {
+        if self.voice.is_none() {
+            return;
+        }
+        if self
+            .streams
+            .eigen()
+            .iter()
+            .any(|s| s.kind == StreamKind::DESKTOP_AUDIO)
+        {
+            return; // delen we al
+        }
+        if self.eigen_muziek().is_some() {
+            return; // Spotify zit er al apart in; zie `zet_spotify`
+        }
+        // Geen afmeting: dit is geluid. De ontvanger leidt daar niets uit af — hij
+        // kijkt naar `kind`.
+        let (_, cmds) = self.streams.deel(
+            StreamKind::DESKTOP_AUDIO,
+            "Bureaubladgeluid".into(),
+            0,
+            0,
+            DeelOpties::default(),
+        );
+        self.stuur_alles(cmds);
+    }
+
+    /// Voert uit wat `streams` besloten heeft. Elke fout hierin is een fout in het
+    /// uitvoeren, niet in de beslissing: de toestand blijft kloppen.
+    fn voer_uit(&mut self, acties: Vec<Actie>) {
+        for actie in acties {
+            match actie {
+                Actie::StartDelen { stream_id, kijkers }
+                | Actie::ZetKijkers { stream_id, kijkers }
+                    if self.is_geluid(stream_id) =>
+                {
+                    // Bureaubladgeluid en muziek gaan over de voice-socket mee, dus
+                    // opnieuw aanzetten met een andere lijst luisteraars is hetzelfde als
+                    // starten. De sessie zelf is idempotent.
+                    let muziek = self.eigen_muziek() == Some(stream_id);
+                    if let Some(v) = &self.voice {
+                        let uitkomst = if muziek {
+                            v.deel_muziek(stream_id, kijkers)
+                        } else {
+                            v.deel_bureaublad(stream_id, kijkers)
+                        };
+                        if let Err(e) = uitkomst {
+                            tracing::error!(error = %format!("{e:#}"), muziek, "geluid delen mislukt");
+                            self.fout = Some(if muziek {
+                                format!("Spotify delen: {e:#}")
+                            } else {
+                                format!("bureaubladgeluid: {e:#}")
+                            });
+                        }
+                    }
+                }
+                Actie::StartDelen { stream_id, kijkers } => {
+                    // Een camera loopt al vóór de eerste kijker, want daar hangt het eigen
+                    // terugblik aan. Dan is "de eerste kijker" niets anders dan een adres
+                    // erbij — tenzij die deler intussen eruit geklapt is, en dan hoort hij
+                    // opnieuw op.
+                    match self.delers.get(&stream_id) {
+                        Some(d) if !d.gestopt() => d.zet_kijkers(kijkers),
+                        _ => {
+                            if let Err(e) = self.start_deler(stream_id, kijkers) {
+                                tracing::error!(error = %format!("{e:#}"), stream = stream_id, "delen starten mislukt");
+                                self.fout = Some(format!("scherm delen: {e:#}"));
+                            }
+                        }
+                    }
+                }
+                Actie::ZetKijkers { stream_id, kijkers } => {
+                    if let Some(d) = self.delers.get(&stream_id) {
+                        d.zet_kijkers(kijkers);
+                    }
+                }
+                Actie::StopDelen {
+                    stream_id,
+                    is_geluid,
+                } => {
+                    if is_geluid {
+                        if let Some(v) = &self.voice {
+                            v.stop_geluid(stream_id);
+                        }
+                    }
+                    // De laatste kijker weg betekent niet dat de deler weg moet: draagt
+                    // deze stream een eigen terugblik, dan blijf je jezelf zien.
+                    // Alleen de kijkerslijst gaat leeg, en dan codeert de deel-lus niets
+                    // meer. Het echte opruimen doet `stop_met_delen`.
+                    if self.heeft_voorbeeld(stream_id) {
+                        if let Some(d) = self.delers.get(&stream_id) {
+                            d.zet_kijkers(Vec::new());
+                        }
+                    } else {
+                        self.delers.remove(&stream_id);
+                    }
+                }
+                Actie::StuurKeyframe { stream_id } => {
+                    if let Some(d) = self.delers.get(&stream_id) {
+                        d.vraag_keyframe();
+                    }
+                }
+                Actie::StartKijken {
+                    eigenaar,
+                    stream_id,
+                    titel,
+                    breedte,
+                    hoogte,
+                    is_geluid,
+                    tweede_scherm,
+                } => {
+                    // Het geluid bij een vanzelf geopend scherm begint stil; de schuif zet het
+                    // aan. Een volume dat de gebruiker al koos blijft staan.
+                    if is_geluid
+                        && !self.stream_volumes.contains_key(&(eigenaar, stream_id))
+                        && self.kijkt_vanzelf_naar(eigenaar)
+                    {
+                        self.zet_stream_volume(eigenaar, stream_id, 0.0);
+                    }
+                    let uitkomst = if is_geluid {
+                        self.luister_mee(eigenaar, stream_id)
+                    } else {
+                        self.start_kijker(
+                            eigenaar,
+                            stream_id,
+                            titel,
+                            breedte,
+                            hoogte,
+                            tweede_scherm,
+                        )
+                    };
+                    if let Err(e) = uitkomst {
+                        tracing::error!(error = %format!("{e:#}"), "kijken starten mislukt");
+                        self.fout = Some(format!("{e:#}"));
+                        // De beslissing terugdraaien, anders denkt de UI dat we kijken.
+                        let (cmds, _) = self.streams.stop_kijken(eigenaar, stream_id);
+                        self.stuur_alles(cmds);
+                    }
+                }
+                Actie::StopKijken {
+                    eigenaar,
+                    stream_id,
+                } => {
+                    self.kijkers.remove(&(eigenaar, stream_id));
+                    self.miniaturen.remove(&(eigenaar, stream_id));
+                    if let Some(v) = &self.voice {
+                        v.vergeet_bron((eigenaar, stream_id));
+                    }
+                }
+                Actie::Tekening {
+                    eigenaar: Some(eigenaar),
+                    stream_id,
+                } => {
+                    if let (Some(k), Some(t)) = (
+                        self.kijkers.get(&(eigenaar, stream_id)),
+                        self.streams.tekening(Some(eigenaar), stream_id),
+                    ) {
+                        k.zet_tekening(t);
+                    }
+                }
+                Actie::Tekening {
+                    eigenaar: None,
+                    stream_id,
+                } => self.werk_deellaag_bij(stream_id),
+                Actie::BedienVraag { stream_id, van } => {
+                    // De deler zit misschien te gamen met het venster weg: een melding, en de
+                    // vraag staat in de app tot hij klikt of hij verloopt. Staat het venster
+                    // vooraan, dan ziet hij de balk al.
+                    if !self.niet_storen && !self.voorgrond.load(Ordering::Relaxed) {
+                        let titel = self
+                            .streams
+                            .eigen()
+                            .iter()
+                            .find(|s| s.id == stream_id)
+                            .map(|s| s.titel.clone())
+                            .unwrap_or_default();
+                        let naam = self.naam_van(van);
+                        notify::nieuw_bericht(
+                            &naam,
+                            &format!(
+                                "wants to control your screen ({titel}). Open FitCom to allow or deny."
+                            ),
+                        );
+                    }
+                }
+                Actie::StartBediening { stream_id } => self.start_bediener(stream_id),
+                Actie::StopBediening { stream_id } => {
+                    self.bedieners.remove(&stream_id);
+                }
+                Actie::Invoer { stream_id, events } => {
+                    if let Some(b) = self.bedieners.get(&stream_id) {
+                        b.invoer(events);
+                    }
+                }
+                Actie::Klembord {
+                    eigenaar: None,
+                    stream_id,
+                    tekst,
+                } => {
+                    if let Some(b) = self.bedieners.get(&stream_id) {
+                        b.klembord(tekst);
+                    }
+                }
+                Actie::Klembord {
+                    eigenaar: Some(eigenaar),
+                    stream_id,
+                    tekst,
+                } => {
+                    if let Some(k) = self.kijkers.get(&(eigenaar, stream_id)) {
+                        k.zet_klembord(tekst);
+                    }
+                }
+                Actie::Bediening {
+                    eigenaar,
+                    stream_id,
+                } => {
+                    if let Some(k) = self.kijkers.get(&(eigenaar, stream_id)) {
+                        k.zet_bediening(self.streams.bedienstand(eigenaar, stream_id));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Onze gedeelde schermen (monitor of venster), voor een schakelaar die op allemaal geldt.
+    fn eigen_schermen(&self) -> Vec<u32> {
+        self.streams
+            .eigen()
+            .iter()
+            .filter(|s| s.kind.is_scherm())
+            .map(|s| s.id)
+            .collect()
+    }
+
+    /// Het bedienen van een eigen monitor begint (beslissing 54): een thread die de invoer in
+    /// het systeem zet en het klembord deelt. Lukt dat niet, dan trekken we het meteen weer in,
+    /// zodat de bediener niet denkt dat hij iets doet.
+    fn start_bediener(&mut self, stream_id: u32) {
+        let monitor = self
+            .bronnen
+            .get(&stream_id)
+            .filter(|b| b.soort == BronSoort::Monitor)
+            .map(|b| b.handle);
+        let tx = self.bedien_tx.clone();
+        let gestart = monitor.context("geen gedeelde monitor").and_then(|m| {
+            fitcom_video::bediening::Bediener::start(m, move |tekst| {
+                let _ = tx.send((stream_id, tekst));
+            })
+        });
+        match gestart {
+            Ok(b) => {
+                self.bedieners.insert(stream_id, b);
+            }
+            Err(e) => {
+                tracing::error!(error = %format!("{e:#}"), stream = stream_id, "bedienen starten mislukt");
+                self.fout = Some(format!("remote control: {e:#}"));
+                let (cmds, _) = self.streams.stop_bediening(stream_id);
+                self.stuur_alles(cmds);
+            }
+        }
+    }
+
+    /// De naam van een peer zoals de chat hem kent, voor een melding.
+    fn naam_van(&self, peer: PeerId) -> String {
+        self.chat
+            .timeline()
+            .nicknames
+            .get(&peer)
+            .cloned()
+            .unwrap_or_else(|| peer.to_string()[..8].to_string())
+    }
+
+    /// De laag met lijnen over een gedeelde monitor (beslissing 45): er alleen zolang er
+    /// lijnen staan, en alleen bij een monitor. Een venster delen heeft geen laag; daar
+    /// staan de lijnen op de eigen tegel in de app. Of hij moet wijken voor een spel dat
+    /// schermvullend draait beslist de laag zelf.
+    fn werk_deellaag_bij(&mut self, stream_id: u32) {
+        let tekening = self
+            .streams
+            .tekening(None, stream_id)
+            .filter(|t| !t.is_leeg());
+        let monitor = self
+            .bronnen
+            .get(&stream_id)
+            .filter(|b| b.soort == BronSoort::Monitor)
+            .map(|b| b.handle);
+        let (Some(tekening), Some(monitor)) = (tekening, monitor) else {
+            self.deellagen.remove(&stream_id);
+            return;
+        };
+        let laag = match self.deellagen.entry(stream_id) {
+            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+            std::collections::hash_map::Entry::Vacant(v) => {
+                match fitcom_video::tekenlaag::Deellaag::start(monitor) {
+                    Ok(laag) => v.insert(laag),
+                    Err(e) => {
+                        tracing::warn!(error = %format!("{e:#}"), "tekenlaag starten mislukt");
+                        return;
+                    }
+                }
+            }
+        };
+        laag.toon(tekening);
+    }
+
+    /// Zet het meeluisteren op andermans bureaubladgeluid gelijk aan wat we van hem
+    /// bekijken. Staat in de lus en niet bij één commando, want de aanleiding kan ook
+    /// een late aankondiging, een gesloten venster of een deelname aan het gesprek zijn.
+    fn volg_geluid_bij_beeld(&mut self) {
+        let (cmds, acties) = self.streams.stem_geluid_af_op_beeld(self.voice.is_some());
+        if cmds.is_empty() && acties.is_empty() {
+            return;
+        }
+        self.stuur_alles(cmds);
+        self.voer_uit(acties);
+    }
+
+    /// Intekenen op andermans bureaubladgeluid. Er komt geen venster en geen eigen
+    /// thread aan te pas: het komt binnen op de voice-poort en de mixer die daar al
+    /// draait telt het er gewoon bij op.
+    fn luister_mee(&mut self, eigenaar: PeerId, stream_id: u32) -> Result<()> {
+        let poort = self
+            .voice
+            .as_ref()
+            .map(|v| v.media_port())
+            .context("neem eerst deel aan het gesprek om meegedeeld geluid te horen")?;
+        let cmds = self.streams.kijker_draait(eigenaar, stream_id, poort);
+        self.stuur_alles(cmds);
+        Ok(())
+    }
+
+    fn start_deler(&mut self, stream_id: u32, kijkers: Vec<PeerAdres>) -> Result<()> {
+        let bron = self
+            .bronnen
+            .get(&stream_id)
+            .cloned()
+            .context("bron van deze stream is verdwenen")?;
+        // Eerst de oude weg, dán de nieuwe erbij. Bij `insert` zou de oude pas ná het
+        // opzetten van de nieuwe vallen, en een camera is dan nog door hem bezet.
+        drop(self.delers.remove(&stream_id));
+
+        let d3d = self.d3d()?;
+        let handle = fitcom_video::deel(
+            &d3d,
+            DelerConfig {
+                stream_id,
+                bron,
+                codec: self.codec(),
+                fps: self.cfg.video.fps,
+                bitrate: self.cfg.video.bitrate,
+                // Elke deler levert een terugblik, ook een scherm: zo zie je wat de
+                // anderen zien. Wat wél alleen voor de camera geldt is dat de deler
+                // blijft bestaan zonder kijkers — zie `heeft_voorbeeld`.
+                voorbeeld: true,
+                post: self.mesh.post.clone(),
+            },
+            kijkers,
+        )?;
+        self.delers.insert(stream_id, handle);
+        Ok(())
+    }
+
+    /// Herstart elke lopende deler met de huidige `cfg.video`. Wordt aangeroepen na een
+    /// instellingenwijziging: zonder dit zou een nieuwe bitrate of codec pas gaan gelden
+    /// bij de volgende keer delen, en dat is niet wat "instellingen aanpassen" belooft.
+    ///
+    /// Bureaubladgeluid draait niet via `delers` maar via de voice-sessie, en heeft geen
+    /// codec-instelling — die blijft dus vanzelf buiten schot.
+    fn herstart_lopende_delers(&mut self) {
+        let actief: Vec<(u32, Vec<PeerAdres>)> = self
+            .streams
+            .eigen()
+            .iter()
+            .filter(|s| self.delers.contains_key(&s.id))
+            .map(|s| (s.id, s.doelen()))
+            .collect();
+        for (id, kijkers) in actief {
+            if let Err(e) = self.start_deler(id, kijkers) {
+                tracing::error!(error = %format!("{e:#}"), stream = id, "deler herstarten na instellingenwijziging mislukt");
+                self.fout = Some(format!("scherm delen: {e:#}"));
+            }
+        }
+    }
+
+    /// Een ander begon een scherm te delen: vanzelf kijken, op het tweede scherm
+    /// (`Config::auto_popout`). Alleen als wij en hij in het gesprek zitten, er een tweede
+    /// scherm is en we deze stream niet al eens openden.
+    fn klap_uit(&mut self, eigenaar: PeerId, stream_id: u32) {
+        if !self.cfg.auto_popout
+            || self.voice.is_none()
+            || !self.peers_in_voice.contains(&eigenaar)
+            || !self.streams.kent(eigenaar, stream_id)
+            || !fitcom_video::venster::heeft_tweede_scherm()
+            || !self.vanzelf_geopend.insert((eigenaar, stream_id))
+        {
+            return;
+        }
+        let mut acties = self.streams.wil_kijken(eigenaar, stream_id);
+        for a in &mut acties {
+            if let Actie::StartKijken { tweede_scherm, .. } = a {
+                *tweede_scherm = true;
+            }
+        }
+        self.voer_uit(acties);
+    }
+
+    /// Kijken we nu naar een scherm van `eigenaar` dat vanzelf openging?
+    fn kijkt_vanzelf_naar(&self, eigenaar: PeerId) -> bool {
+        self.streams.vreemd().iter().any(|s| {
+            s.eigenaar == eigenaar && s.kijken && self.vanzelf_geopend.contains(&(eigenaar, s.id))
+        })
+    }
+
+    /// Het gekozen scherm voor een vanzelf geopend venster (`Config::popout_monitor`), op
+    /// naam in de schermenlijst van nu. Weg of niet gekozen: een ander scherm.
+    fn popout_scherm(&self) -> fitcom_video::Scherm {
+        let Some(naam) = &self.cfg.popout_monitor else {
+            return fitcom_video::Scherm::Ander;
+        };
+        fitcom_video::beschikbare_bronnen()
+            .unwrap_or_default()
+            .into_iter()
+            .find(|b| b.soort == fitcom_video::BronSoort::Monitor && &b.naam == naam)
+            .map_or(fitcom_video::Scherm::Ander, |b| {
+                fitcom_video::Scherm::Monitor(b.handle)
+            })
+    }
+
+    fn start_kijker(
+        &mut self,
+        eigenaar: PeerId,
+        stream_id: u32,
+        titel: String,
+        breedte: u32,
+        hoogte: u32,
+        tweede_scherm: bool,
+    ) -> Result<()> {
+        if !self.verbonden.contains_key(&eigenaar) {
+            anyhow::bail!("die peer is niet verbonden");
+        }
+        let d3d = self.d3d()?;
+        let naam = self
+            .peers
+            .iter()
+            .find(|p| p.peer_id == Some(eigenaar))
+            .map(|p| p.label.clone())
+            .unwrap_or_else(|| "peer".into());
+
+        // De codec hier is een startgok: de kijker leest de echte codec van de
+        // pakketten zelf en wisselt zijn decoder als de deler iets anders stuurt.
+        // Een gok die deze machine niet eens kán decoderen (HEVC zonder
+        // Store-extensie, HEVC op macOS) liet het opzetten meteen stranden —
+        // daarom valt hij terug op H.264, dat overal decodeert.
+        let gok = self.codec();
+        let gok = if gok.kan_decoderen() {
+            gok
+        } else {
+            Codec::H264
+        };
+
+        let handle = fitcom_video::kijk(
+            &d3d,
+            KijkerConfig {
+                stream_id,
+                titel: format!("{naam} — {titel}"),
+                breedte,
+                hoogte,
+                codec: gok,
+                afzender: eigenaar,
+                post: self.mesh.post.clone(),
+                menu: Some(crate::ui::theme::viewer_menu_style()),
+                plaatsing: fitcom_video::Plaatsing {
+                    vanzelf: tweede_scherm.then(|| self.popout_scherm()),
+                    maat: self.cfg.viewer_size,
+                    volledig: self.cfg.viewer_fullscreen,
+                },
+            },
+        )?;
+
+        // Nu pas intekenen: in het abonnement staat de poort van dit venster, en die
+        // bestaat pas als het venster er is.
+        let cmds = self
+            .streams
+            .kijker_draait(eigenaar, stream_id, handle.poort);
+        self.stuur_alles(cmds);
+
+        // Meldingen van het kijkvenster meteen de motorlus in laten vallen. Het venster
+        // leeft op een eigen thread met een crossbeam-kanaal, en tokio kan daar niet op
+        // wachten — vandaar dit ene doorgeefluik, dat vanzelf ophoudt zodra de kijker
+        // stopt en zijn kant van het kanaal loslaat.
+        let door = self.kijker_tx.clone();
+        let ontvangen = handle.events.clone();
+        std::thread::Builder::new()
+            .name(format!("fitcom-kijkerpost-{stream_id}"))
+            .spawn(move || {
+                while let Ok(ev) = ontvangen.recv() {
+                    if door.send((eigenaar, stream_id, ev)).is_err() {
+                        break;
+                    }
+                }
+            })
+            .context("doorgeefthread voor kijkermeldingen starten")?;
+
+        // Of de deler tekenen toestaat weet het venster zo meteen; de lijnen zelf volgen
+        // als de deler ons intekenen ziet.
+        if let Some(t) = self.streams.tekening(Some(eigenaar), stream_id) {
+            handle.zet_tekening(t);
+        }
+        // En of de deler zich laat bedienen (beslissing 54): dan heeft het menu de keuze.
+        handle.zet_bediening(self.streams.bedienstand(eigenaar, stream_id));
+        self.kijkers.insert((eigenaar, stream_id), handle);
+        Ok(())
+    }
+
+    /// Het volume van één stream van een peer, los van zijn stem: vanuit de audio-popover en
+    /// vanuit het menu in het kijkvenster, op dezelfde sleutel.
+    fn zet_stream_volume(&mut self, peer: PeerId, id: u32, vol: f32) {
+        self.stream_volumes.insert((peer, id), vol);
+        if let Some(v) = &self.voice {
+            v.zet_bron_volume((peer, id), vol);
+        }
+    }
+
+    /// Het geluid bij een bekeken scherm: het bureaubladgeluid van dezelfde peer, als we dat
+    /// nu horen, met zijn volume. Een camera heeft geen geluid (`is_scherm`).
+    fn geluid_bij_beeld(&self, eigenaar: PeerId, stream_id: u32) -> Option<(u32, f32)> {
+        let vreemd = self.streams.vreemd();
+        vreemd
+            .iter()
+            .find(|s| s.eigenaar == eigenaar && s.id == stream_id)
+            .filter(|s| s.kind.is_scherm())?;
+        let geluid = vreemd.iter().find(|s| {
+            s.eigenaar == eigenaar && s.kind.is_geluid() && s.kind != StreamKind::MUSIC && s.kijken
+        })?;
+        let vol = self
+            .stream_volumes
+            .get(&(eigenaar, geluid.id))
+            .copied()
+            .unwrap_or(1.0);
+        Some((geluid.id, vol))
+    }
+
+    /// Eén melding van een kijkvenster: gesloten, een keyframe nodig, of een nieuwe
+    /// miniatuur.
+    ///
+    /// Komt binnen via de select-lus en niet op de tik. Dat verschil is niet cosmetisch:
+    /// een kijker die een fragment mist toont geen enkel beeld meer tot er een keyframe
+    /// is, dus elke milliseconde die het verzoek hier blijft liggen is een milliseconde
+    /// bevroren beeld aan de andere kant. Op de tik was dat tot honderd milliseconde —
+    /// de helft van de gemeten hapering. Zie `crates/video/src/fragment.rs`.
+    fn lees_kijker(&mut self, eigenaar: PeerId, stream_id: u32, ev: KijkerEvent) {
+        match ev {
+            KijkerEvent::KeyframeNodig => {
+                let cmds = self.streams.vraag_keyframe(eigenaar, stream_id);
+                self.stuur_alles(cmds);
+            }
+            KijkerEvent::Miniatuur(m) => {
+                self.miniaturen.insert((eigenaar, stream_id), m);
+            }
+            KijkerEvent::Gesloten => {
+                self.miniaturen.remove(&(eigenaar, stream_id));
+                let (cmds, acties) = self.streams.stop_kijken(eigenaar, stream_id);
+                self.stuur_alles(cmds);
+                self.voer_uit(acties);
+            }
+            KijkerEvent::Maat(b, h) => {
+                if self.cfg.viewer_size != Some((b, h)) {
+                    self.cfg.viewer_size = Some((b, h));
+                    if let Err(e) = self.cfg.save(&self.config_path) {
+                        self.fout = Some(format!("config opslaan: {e:#}"));
+                    }
+                }
+            }
+            KijkerEvent::VolledigScherm(v) => {
+                if self.cfg.viewer_fullscreen != v {
+                    self.cfg.viewer_fullscreen = v;
+                    if let Err(e) = self.cfg.save(&self.config_path) {
+                        self.fout = Some(format!("config opslaan: {e:#}"));
+                    }
+                }
+            }
+            KijkerEvent::Volume(vol) => {
+                if let Some((id, _)) = self.geluid_bij_beeld(eigenaar, stream_id) {
+                    self.zet_stream_volume(eigenaar, id, vol);
+                }
+            }
+            KijkerEvent::Bericht(msg @ (ControlMsg::Draw(_) | ControlMsg::DrawClear(_))) => {
+                let cmds = self.streams.kijker_tekent(eigenaar, stream_id, msg);
+                self.stuur_alles(cmds);
+            }
+            KijkerEvent::Bericht(msg) => {
+                let stil = matches!(msg, ControlMsg::RemoteInput(_));
+                let (cmds, acties) = self.streams.kijker_bedient(eigenaar, stream_id, msg);
+                self.stuur_alles(cmds);
+                self.voer_uit(acties);
+                // Onze eigen invoer als bediener verandert niets in het hoofdvenster.
+                self.stil = stil;
+            }
+        }
+    }
+
+    // -- UI ----------------------------------------------------------------
+
+    fn op_ui_command(&mut self, cmd: UiCommand) {
+        match cmd {
+            UiCommand::Plaats(tekst, channel, reply_to) => {
+                let r = self.chat.plaats_bericht(&tekst, channel, reply_to);
+                self.verwerk(r);
+                // Het antwoord is verstuurd: de "typt"-indicatie mag weg.
+                self.typing_verzonden.remove(&channel);
+            }
+            UiCommand::Reageer(doel, emoji) => {
+                let r = self.chat.reageer(doel, &emoji);
+                self.verwerk(r);
+            }
+            UiCommand::Typing(channel) => self.stuur_typing(channel),
+            UiCommand::ZetStatus(status) => self.zet_status(status),
+            UiCommand::ZetActiviteitDelen(aan) => {
+                if self.cfg.share_activity != aan {
+                    self.cfg.share_activity = aan;
+                    if let Err(e) = self.cfg.save(&self.config_path) {
+                        self.fout = Some(format!("config opslaan: {e:#}"));
+                    }
+                }
+                if !aan {
+                    // Uit betekent niets sturen, en wat de anderen nog van ons tonen
+                    // moet weg: een lege naam is "niets (meer)".
+                    if self.speelt_rust.huidig().is_some() {
+                        self.stuur_activiteit(String::new());
+                    }
+                    self.speelt_rust.wis();
+                    self.speelt_gemeten = None;
+                }
+            }
+            UiCommand::ZetClips(aan) => {
+                if self.cfg.clips.enabled != aan {
+                    self.cfg.clips.enabled = aan;
+                    if let Err(e) = self.cfg.save(&self.config_path) {
+                        self.fout = Some(format!("config opslaan: {e:#}"));
+                    }
+                }
+                self.zet_clips_motor(aan);
+                // Bij een mislukte start staat de motor ook echt uit; de schakelaar
+                // mag niet liegen over wat er draait.
+                if aan && !self.clips.aan() {
+                    self.cfg.clips.enabled = false;
+                    let _ = self.cfg.save(&self.config_path);
+                }
+            }
+            UiCommand::ClipseNu => {
+                tracing::info!(
+                    enabled = self.cfg.clips.enabled,
+                    opname_loopt = self.clips.aan(),
+                    "clip-save aangevraagd via de knop"
+                );
+                if self.cfg.clips.enabled && self.clips.aan() {
+                    self.clips.bewaar_nu();
+                } else {
+                    self.fout = Some("Clips staan uit (instellingen → clips).".into());
+                }
+            }
+            UiCommand::DeelLaatsteClip => match self.clips.laatste() {
+                Some(pad) => self.deel_clip(&pad),
+                None => self.fout = Some("Er is nog geen clip bewaard in deze sessie.".into()),
+            },
+            UiCommand::ZetClipsAutoDelen(aan) => {
+                if self.cfg.clips.auto_delen != aan {
+                    self.cfg.clips.auto_delen = aan;
+                    if let Err(e) = self.cfg.save(&self.config_path) {
+                        self.fout = Some(format!("config opslaan: {e:#}"));
+                    }
+                }
+            }
+            UiCommand::ZetClipMonitor(naam) => {
+                let gekozen = if naam.trim().is_empty() {
+                    None
+                } else {
+                    Some(naam)
+                };
+                if self.cfg.clips.monitor != gekozen {
+                    self.cfg.clips.monitor = gekozen.map(|s| s.to_string());
+                    if let Err(e) = self.cfg.save(&self.config_path) {
+                        self.fout = Some(format!("config opslaan: {e:#}"));
+                        return;
+                    }
+                    // Draait de opname al? Dan meteen herstarten op het nieuwe
+                    // scherm — een wisseling halverwege kan de keten niet aan,
+                    // maar een paar seconden opnieuw opstarten is genoeg troost.
+                    let stond_aan = self.clips.aan();
+                    if stond_aan {
+                        self.zet_clips_motor(false);
+                        self.zet_clips_motor(true);
+                    }
+                }
+            }
+            UiCommand::ZetClipLengte(sec) => {
+                let sec = sec.clamp(10, crate::config::MAX_CLIP_SEC);
+                if self.cfg.clips.venster_sec != sec {
+                    self.cfg.clips.venster_sec = sec;
+                    if let Err(e) = self.cfg.save(&self.config_path) {
+                        self.fout = Some(format!("config opslaan: {e:#}"));
+                        return;
+                    }
+                    // De ring kent zijn lengte vanaf het starten; opnieuw opstarten, net
+                    // als bij een ander scherm. Wat er al in de ring stond blijft niet
+                    // staan, maar een clip langer dan de opname tot nu toe kon toch niet.
+                    if self.clips.aan() {
+                        self.zet_clips_motor(false);
+                        self.zet_clips_motor(true);
+                    }
+                }
+            }
+            UiCommand::ZetClipBeeld {
+                fps,
+                resolutie,
+                kwaliteit,
+            } => {
+                let geldig = crate::clips::CLIP_FPS.contains(&fps)
+                    && crate::clips::RESOLUTIES.iter().any(|r| r.0 == resolutie)
+                    && crate::clips::KWALITEITEN.iter().any(|k| k.0 == kwaliteit);
+                if !geldig {
+                    self.fout = Some(format!(
+                        "clips: onbekend beeld {fps} fps, {resolutie}, {kwaliteit}"
+                    ));
+                    return;
+                }
+                let c = &mut self.cfg.clips;
+                if (c.fps, c.resolution.as_str(), c.quality.as_str())
+                    != (fps, resolutie.as_str(), kwaliteit.as_str())
+                {
+                    (c.fps, c.resolution, c.quality) = (fps, resolutie, kwaliteit);
+                    if let Err(e) = self.cfg.save(&self.config_path) {
+                        self.fout = Some(format!("config opslaan: {e:#}"));
+                        return;
+                    }
+                    // De encoder kent maat en bitrate vanaf het starten; opnieuw opstarten,
+                    // net als bij een andere lengte.
+                    if self.clips.aan() {
+                        self.zet_clips_motor(false);
+                        self.zet_clips_motor(true);
+                    }
+                }
+            }
+            UiCommand::ZetClipsHotkey(spec) => {
+                let spec = spec.trim().to_string();
+                // Eerst valideren: een typefout mag de werkende toets niet slopen.
+                if let Err(e) = crate::clips::ontled_hotkey(&spec) {
+                    self.fout = Some(format!("sneltoets: {e:#}"));
+                    return;
+                }
+                self.cfg.clips.hotkey = spec.clone();
+                if let Err(e) = self.cfg.save(&self.config_path) {
+                    self.fout = Some(format!("config opslaan: {e:#}"));
+                    return;
+                }
+                // Eerst de oude draad écht weg (Drop → WM_QUIT → unregister → join),
+                // pas daarna de nieuwe. In één toewijzing gaat dat mis: Rust maakt de
+                // rechterkant vóór hij de oude laat vallen, en `RegisterHotKey` weigert
+                // een toets die nog geregistreerd staat — dezelfde sneltoets opnieuw
+                // instellen liet je dan zonder sneltoets achter.
+                self.hotkey_draad = crate::clips::HotkeyDraad::dode();
+                // De verzender naar onszelf blijft dezelfde: de tik leest het kanaal uit.
+                self.hotkey_draad = crate::clips::start_hotkey(&spec, {
+                    let tx = self.clip_hotkey_verzender.clone();
+                    move || {
+                        let _ = tx.send(());
+                    }
+                })
+                .unwrap_or_else(|e| {
+                    tracing::warn!(error = %format!("{e:#}"), "nieuwe clip-hotkey mislukt");
+                    self.fout = Some(format!("sneltoets: {e:#}"));
+                    crate::clips::HotkeyDraad::dode()
+                });
+            }
+            UiCommand::ZetClipMap(pad) => {
+                if let Err(e) = std::fs::create_dir_all(&pad) {
+                    tracing::warn!(error = %e, pad = %pad.display(), "clipmap aanmaken mislukt");
+                    self.fout = Some(format!("clipmap aanmaken: {e}"));
+                    return;
+                }
+                if self.clips.map() == pad {
+                    return;
+                }
+                self.cfg.clips.map = Some(pad.clone());
+                if let Err(e) = self.cfg.save(&self.config_path) {
+                    self.fout = Some(format!("config opslaan: {e:#}"));
+                    return;
+                }
+                let stond_aan = self.clips.aan();
+                if stond_aan {
+                    self.zet_clips_motor(false);
+                }
+                // `zet_map` ruimt de ring van de oude map op — die draagt tijden van
+                // deze sessie en wordt nooit meer gelezen. De clips zelf blijven staan.
+                self.clips.zet_map(pad);
+                if stond_aan {
+                    self.zet_clips_motor(true);
+                }
+            }
+            UiCommand::Bewerk(doel, tekst) => {
+                let r = self.chat.bewerk_bericht(doel, &tekst);
+                self.verwerk(r);
+            }
+            UiCommand::Verwijder(doel) => {
+                // Generiek: `doel` kan een bericht zijn of een eigen bestandsaanbod. Is
+                // het het laatste, dan moet `verzoek_ontvangen` het na deze klik ook
+                // echt niet meer serveren — anders verdwijnt alleen de kaart uit de
+                // tijdlijn terwijl het bestand nog gewoon downloadbaar blijft voor wie
+                // de OpId al kende. Een no-op als `doel` geen eigen aanbod is.
+                if self.files.verwijder_aanbod(doel) {
+                    self.bewaar_paden();
+                }
+                let r = self.chat.verwijder_bericht(doel);
+                self.verwerk(r);
+            }
+            UiCommand::Gelezen => self.chat.markeer_gelezen(),
+            UiCommand::GelezenDm(peer) => self.chat.markeer_dm_gelezen(peer),
+            UiCommand::GelezenTopic(topic) => self.chat.markeer_topic_gelezen(topic),
+            UiCommand::FoutWeg => self.fout = None,
+            UiCommand::VoiceDeelnemen => self.deelnemen(),
+            UiCommand::VoiceVerlaten => {
+                self.verlaten();
+                // Wie het gesprek verlaat stopt ook met delen: een scherm of camera die
+                // blijft lopen nadat je weg bent moest je anders apart uitzetten. Alleen
+                // hier en niet in `verlaten` zelf, want een apparaatwissel gaat ook door
+                // `verlaten` en hoort je stream niet af te breken. Bureaubladgeluid heeft
+                // `verlaten` al opgeruimd.
+                let eigen: Vec<u32> = self
+                    .streams
+                    .eigen()
+                    .iter()
+                    .filter(|s| !s.kind.is_geluid())
+                    .map(|s| s.id)
+                    .collect();
+                for id in eigen {
+                    self.stop_met_delen(id);
+                }
+            }
+            UiCommand::Mute(aan) => {
+                if let Some(v) = &self.voice {
+                    v.zet_mute(aan);
+                }
+                self.meld_mute(None);
+            }
+            UiCommand::Deafen(aan) => {
+                if let Some(v) = &self.voice {
+                    v.zet_deafen(aan);
+                }
+                self.meld_mute(None);
+            }
+            UiCommand::Volume(peer, vol) => {
+                if let Some(v) = &self.voice {
+                    v.zet_volume(peer, vol);
+                }
+                if let Some(p) = self.peers.iter_mut().find(|p| p.peer_id == Some(peer)) {
+                    p.volume = vol;
+                }
+            }
+            UiCommand::DeelBron(bron, opties) => {
+                self.deel_bron(bron, opties);
+            }
+            UiCommand::DeelSpel => {
+                let spel = self.speelt_rust.huidig().map(str::to_owned);
+                if let (Some(naam), Some(handle)) = (spel, self.speelt_zoeker.venster) {
+                    // Zonder kiezer: de standaard uit de config. Een venster laat zich nooit
+                    // bedienen, dus dat telt hier niet.
+                    let opties = DeelOpties {
+                        tekenen: self.cfg.allow_drawing,
+                        bedienen: self.cfg.allow_remote_control,
+                    };
+                    self.deel_bron(
+                        Bron {
+                            naam,
+                            soort: BronSoort::Venster,
+                            handle,
+                        },
+                        opties,
+                    );
+                }
+            }
+            UiCommand::StreamVolume(peer, id, vol) => self.zet_stream_volume(peer, id, vol),
+            UiCommand::ZetVideoInstellingen(video) => {
+                self.cfg.video = video;
+                if let Err(e) = self.cfg.save(&self.config_path) {
+                    tracing::warn!(error = %format!("{e:#}"), "video-instellingen niet opgeslagen");
+                    self.fout = Some(format!("instellingen opslaan: {e:#}"));
+                }
+                self.herstart_lopende_delers();
+            }
+            UiCommand::ZetGeluidInstellingen(geluid) => {
+                // Volume begrenzen op wat het betekent, niet vertrouwen op de schuif: dit
+                // komt uit het venster en 1.4 zou de tonen laten vervormen.
+                // Door dezelfde opschoning als bij het inlezen: het venster kan een NaN of
+                // een 1.4 doorgeven, en dat zou stilte of vervorming opleveren.
+                let mut veilig = SoundConfig {
+                    // Een onbekende naam niet opslaan: dan zou de config iets bevatten dat
+                    // nergens naar verwijst en zou er in de kiezer niets geselecteerd staan.
+                    // De frontend stuurt alleen namen die hij van de motor kreeg, dus dit is
+                    // een grens en geen verwacht geval.
+                    set: match geluid::Geluidset::van_naam(&geluid.set) {
+                        Some(_) => geluid.set,
+                        None => {
+                            tracing::warn!(gekozen = %geluid.set, "onbekende geluidset geweigerd");
+                            self.cfg.sound.set.clone()
+                        }
+                    },
+                    volume: geluid.volume,
+                };
+                veilig.herstel();
+                if veilig == self.cfg.sound {
+                    // Niets veranderd: niet opslaan (dat is een schrijfactie per klik) en
+                    // niet afspelen (dan piept de app bij elk hertekenen van het scherm).
+                    return;
+                }
+                self.cfg.sound = veilig;
+                if let Err(e) = self.cfg.save(&self.config_path) {
+                    tracing::warn!(error = %format!("{e:#}"), "geluidsinstellingen niet opgeslagen");
+                    self.fout = Some(format!("instellingen opslaan: {e:#}"));
+                }
+                // Meteen laten horen wat je gekozen hebt.
+                self.speel_geluid(geluid::Geluid::EigenJoin);
+            }
+            UiCommand::ZetSpreektoets(nieuw) => {
+                // Dezelfde opschoning als bij het inlezen. Het venster stuurt alleen namen
+                // uit de tabel, dus een onbekende is een grens en geen verwacht geval; wat
+                // we dan niet kennen houdt de vorige waarde, niet de standaard.
+                let mut veilig = nieuw;
+                if fitcom_audio::spreektoets::Modus::van_naam(&veilig.mode).is_none() {
+                    tracing::warn!(modus = %veilig.mode, "onbekende push-to-talk-modus geweigerd");
+                    veilig.mode = self.cfg.push_to_talk.mode.clone();
+                }
+                if fitcom_audio::spreektoets::toets_van_naam(&veilig.key).is_none() {
+                    tracing::warn!(toets = %veilig.key, "onbekende push-to-talk-toets geweigerd");
+                    veilig.key = self.cfg.push_to_talk.key.clone();
+                }
+                veilig.herstel();
+                if veilig == self.cfg.push_to_talk {
+                    return;
+                }
+                self.cfg.push_to_talk = veilig;
+                if let Err(e) = self.cfg.save(&self.config_path) {
+                    tracing::warn!(error = %format!("{e:#}"), "push-to-talk niet opgeslagen");
+                    self.fout = Some(format!("instellingen opslaan: {e:#}"));
+                }
+                // Geen herstart van de sessie: de opname-thread leest dit per frame.
+                if let Some(v) = &self.voice {
+                    let (modus, vk) = self.cfg.push_to_talk.voor_audio();
+                    v.zet_spreektoets(modus, vk);
+                }
+            }
+            UiCommand::ProefGeluid(naam) => match geluid::Geluid::van_naam(&naam) {
+                Some(g) => self.speel_geluid(g),
+                None => tracing::warn!(?naam, "onbekend geluid gevraagd voor de proef"),
+            },
+            UiCommand::ZetGeluidsapparaten(invoer, uitvoer) => {
+                self.cfg.input_device = invoer;
+                self.cfg.output_device = uitvoer;
+                if let Err(e) = self.cfg.save(&self.config_path) {
+                    tracing::warn!(error = %format!("{e:#}"), "geluidsapparaten niet opgeslagen");
+                    self.fout = Some(format!("instellingen opslaan: {e:#}"));
+                }
+                // De apparaten worden één keer gekozen, bij het openen van de sessie
+                // (`fitcom_audio::start`). Zit je in een gesprek, dan is opnieuw openen
+                // de enige manier om te wisselen; `bind_met_geduld` vangt op dat de
+                // mediapoort nog even bezet is.
+                if let Some(v) = &self.voice {
+                    // De nieuwe sessie begint ongemute; wie gemute was zou anders na een
+                    // apparaatwissel ongemerkt weer open staan.
+                    let (mute, deafen) = (v.is_mute(), v.is_deafen());
+                    // `verlaten` trekt de muziek in; een apparaatwissel hoort dat niet te doen.
+                    let muziek = self.eigen_muziek().is_some();
+                    self.verlaten();
+                    self.deelnemen();
+                    if let Some(v) = &self.voice {
+                        v.zet_mute(mute);
+                        v.zet_deafen(deafen);
+                    }
+                    // `deelnemen` meldde de Join met een open microfoon.
+                    self.meld_mute(None);
+                    if muziek {
+                        self.zet_spotify(true);
+                    }
+                }
+                // De clip-opname kiest zijn microfoon op hetzelfde moment: bij het
+                // starten. Draait hij, dan moet hij dus ook opnieuw, anders neemt hij
+                // stilzwijgend het oude apparaat op tot de volgende herstart.
+                if self.clips.aan() {
+                    self.zet_clips_motor(false);
+                    self.zet_clips_motor(true);
+                }
+            }
+            UiCommand::ZetDownloadMap(pad) => {
+                if let Err(e) = std::fs::create_dir_all(&pad) {
+                    tracing::warn!(error = %e, pad = %pad.display(), "downloadmap aanmaken mislukt");
+                    self.fout = Some(format!("downloadmap aanmaken: {e}"));
+                } else {
+                    self.cfg.download_dir = Some(pad.clone());
+                    if let Err(e) = self.cfg.save(&self.config_path) {
+                        tracing::warn!(error = %format!("{e:#}"), "downloadmap niet opgeslagen");
+                        self.fout = Some(format!("instellingen opslaan: {e:#}"));
+                    }
+                    self.downloads_dir = pad.clone();
+                    // Gedownloade bestanden blijven waar ze zijn — dat staat ook zo in het
+                    // instellingenscherm. Afbeeldingen kunnen dat niet: hun pad is
+                    // afgeleid uit waar de afbeeldingenmap staat, dus blijven staan
+                    // betekent uit de tijdlijn verdwijnen. Ze verhuizen mee.
+                    let nieuw = config::pictures_in(&pad);
+                    if nieuw != self.pictures_dir {
+                        if let Err(e) = std::fs::create_dir_all(&nieuw) {
+                            tracing::warn!(error = %e, pad = %nieuw.display(), "afbeeldingenmap aanmaken mislukt");
+                            self.fout = Some(format!("afbeeldingenmap aanmaken: {e}"));
+                        } else {
+                            let oud = std::mem::replace(&mut self.pictures_dir, nieuw.clone());
+                            verhuis_afbeeldingen(&oud, &nieuw);
+                            self.verhuis_padkaarten(&oud, &nieuw);
+                        }
+                    }
+                }
+            }
+            UiCommand::StopDelen(id) => self.stop_met_delen(id),
+            UiCommand::ZetCamera(aan) => self.zet_camera(aan),
+            UiCommand::DeelSpotify(aan) => self.zet_spotify(aan),
+            UiCommand::BedienMuziek(dj, stream_id, action) => {
+                // Alleen naar de DJ zelf; hij beslist of hij het uitvoert.
+                self.stuur_alles(vec![MeshCommand::Send {
+                    to: dj,
+                    msg: ControlMsg::MusicControl(MusicControl { stream_id, action }),
+                }]);
+            }
+            UiCommand::Kijken(eigenaar, id) => {
+                let acties = self.streams.wil_kijken(eigenaar, id);
+                self.voer_uit(acties);
+            }
+            UiCommand::StopKijken(eigenaar, id) => {
+                let (cmds, acties) = self.streams.stop_kijken(eigenaar, id);
+                self.stuur_alles(cmds);
+                self.voer_uit(acties);
+            }
+            UiCommand::ZetPopoutMonitor(naam) => {
+                let gekozen = Some(naam.trim().to_string()).filter(|n| !n.is_empty());
+                if self.cfg.popout_monitor != gekozen {
+                    self.cfg.popout_monitor = gekozen;
+                    if let Err(e) = self.cfg.save(&self.config_path) {
+                        self.fout = Some(format!("config opslaan: {e:#}"));
+                    }
+                }
+            }
+            UiCommand::ZetAutoPopout(aan) => {
+                if self.cfg.auto_popout != aan {
+                    self.cfg.auto_popout = aan;
+                    if let Err(e) = self.cfg.save(&self.config_path) {
+                        self.fout = Some(format!("config opslaan: {e:#}"));
+                    }
+                }
+            }
+            UiCommand::ZetTekenen(aan) => {
+                if self.cfg.allow_drawing != aan {
+                    self.cfg.allow_drawing = aan;
+                    if let Err(e) = self.cfg.save(&self.config_path) {
+                        self.fout = Some(format!("config opslaan: {e:#}"));
+                    }
+                }
+                // Uit is ook uit op wat loopt; aan is alleen de standaard (beslissing 54).
+                if !aan {
+                    for id in self.eigen_schermen() {
+                        let (cmds, acties) = self.streams.zet_tekenen(id, false);
+                        self.stuur_alles(cmds);
+                        self.voer_uit(acties);
+                    }
+                }
+            }
+            UiCommand::ZetBedienen(aan) => {
+                if self.cfg.allow_remote_control != aan {
+                    self.cfg.allow_remote_control = aan;
+                    if let Err(e) = self.cfg.save(&self.config_path) {
+                        self.fout = Some(format!("config opslaan: {e:#}"));
+                    }
+                }
+                if !aan {
+                    for id in self.eigen_schermen() {
+                        let (cmds, acties) = self.streams.zet_bedienen(id, false);
+                        self.stuur_alles(cmds);
+                        self.voer_uit(acties);
+                    }
+                }
+            }
+            UiCommand::ZetStreamTekenen(id, aan) => {
+                let (cmds, acties) = self.streams.zet_tekenen(id, aan);
+                self.stuur_alles(cmds);
+                self.voer_uit(acties);
+            }
+            UiCommand::ZetStreamBedienen(id, aan) => {
+                let (cmds, acties) = self.streams.zet_bedienen(id, aan && BEDIENEN_KAN);
+                self.stuur_alles(cmds);
+                self.voer_uit(acties);
+            }
+            UiCommand::StaBedieningToe(id, peer) => {
+                let (cmds, acties) = self.streams.sta_bediening_toe(id, peer);
+                self.stuur_alles(cmds);
+                self.voer_uit(acties);
+            }
+            UiCommand::WeigerBediening(id) => {
+                let cmds = self.streams.weiger_bediening(id);
+                self.stuur_alles(cmds);
+            }
+            UiCommand::StopBediening(id) => {
+                let (cmds, acties) = self.streams.stop_bediening(id);
+                self.stuur_alles(cmds);
+                self.voer_uit(acties);
+            }
+            UiCommand::ZetOverlay(aan) => {
+                if self.cfg.overlay.enabled != aan {
+                    self.cfg.overlay.enabled = aan;
+                    if let Err(e) = self.cfg.save(&self.config_path) {
+                        self.fout = Some(format!("config opslaan: {e:#}"));
+                    }
+                }
+            }
+            UiCommand::ZetOverlayAltijd(aan) => {
+                if self.cfg.overlay.always != aan {
+                    self.cfg.overlay.always = aan;
+                    if let Err(e) = self.cfg.save(&self.config_path) {
+                        self.fout = Some(format!("config opslaan: {e:#}"));
+                    }
+                }
+            }
+            UiCommand::ZetOverlayPlek(x, y) => {
+                if (self.cfg.overlay.x, self.cfg.overlay.y) != (Some(x), Some(y)) {
+                    self.cfg.overlay.x = Some(x);
+                    self.cfg.overlay.y = Some(y);
+                    if let Err(e) = self.cfg.save(&self.config_path) {
+                        self.fout = Some(format!("config opslaan: {e:#}"));
+                    }
+                }
+            }
+            UiCommand::WisTekening(id) => {
+                let (cmds, acties) = self.streams.wis_tekening(id);
+                self.stuur_alles(cmds);
+                self.voer_uit(acties);
+            }
+            UiCommand::BiedBestandAan(pad, channel) => {
+                let tx = self.file_tx.clone();
+                let pictures_dir = self.pictures_dir.clone();
+                tokio::spawn(hash_en_bied_aan(pad, channel, pictures_dir, tx));
+            }
+            UiCommand::DownloadBestand(file) => self.download_bestand(file),
+            UiCommand::ZetNaam(naam) => self.zet_naam(&naam),
+            UiCommand::ZetAvatar(pad) => self.zet_avatar(pad.as_deref()),
+            UiCommand::VoegCodesToe(tekst) => self.voeg_codes_toe(&tekst),
+            UiCommand::VerwijderPeer(plek) => self.verwijder_peer(plek),
+            UiCommand::NietStoren(aan) => self.niet_storen = aan,
+            UiCommand::VerwijderAlleAfbeeldingen => self.verwijder_alle_afbeeldingen(),
+            UiCommand::MaakKanaal(titel) => {
+                let r = self.chat.zet_kanaal_titel(TopicId::new_random(), &titel);
+                self.verwerk(r);
+            }
+            UiCommand::HernoemKanaal(id, titel) => {
+                let r = self.chat.zet_kanaal_titel(id, &titel);
+                self.verwerk(r);
+            }
+            UiCommand::VerwijderKanaal(id) => {
+                let r = self.chat.verwijder_kanaal(id);
+                self.verwerk(r);
+            }
+            UiCommand::ZoekUpdate => self.zoek_update(true),
+            UiCommand::PasUpdateToe => self.pas_update_toe(),
+            UiCommand::NegeerUpdate(versie) => self.updates.negeer(&versie),
+            UiCommand::WisUpdateMelding => self.updates.wis_melding(),
+            UiCommand::WordleGok(woord) => self.wordle_gok(&woord),
+            UiCommand::WordleInChat => self.wordle_in_chat(),
+        }
+    }
+
+    // -- wordle (2026-08-20) -----------------------------------------------
+
+    /// Eén gok. De uitslag van een afgerond spel gaat meteen de oplog in, zodat de anderen
+    /// hem zien zonder dat er iets extra's over de draad hoeft.
+    fn wordle_gok(&mut self, woord: &str) {
+        if let wordle::Gok::Klaar {
+            dag,
+            pogingen,
+            gewonnen,
+            patroon,
+            seconden,
+        } = self.wordle.gok(woord)
+        {
+            tracing::info!(dag, pogingen, gewonnen, seconden, "wordle afgerond");
+            let r = self
+                .chat
+                .meld_wordle(dag, pogingen, gewonnen, patroon, Some(seconden));
+            self.verwerk(r);
+        }
+    }
+
+    /// Eén meetstap voor de terugblik: wie zit er nu in het gesprek, en wie deelt er iets.
+    ///
+    /// Bureaubladgeluid telt niet als delen. Dat komt sinds fase 10 vanzelf met een scherm
+    /// mee, dus het zou elke gedeelde monitor dubbel tellen — dezelfde reden waarom
+    /// `StreamKind::is_scherm()` bestaat.
+    ///
+    /// Wat hier gemeten wordt is wat **deze pc gezien heeft**: een peer die deelt terwijl
+    /// wij offline zijn telt niet mee. Zie de moduledoc van `crate::gebruik`.
+    fn meet_gebruik(&mut self) {
+        let me = self.chat.me();
+
+        let mut in_voice: Vec<PeerId> = self.peers_in_voice.iter().copied().collect();
+        if self.voice.is_some() && !in_voice.contains(&me) {
+            in_voice.push(me);
+        }
+
+        let mut deelt: Vec<PeerId> = Vec::new();
+        if self.streams.eigen().iter().any(|s| !s.kind.is_geluid()) {
+            deelt.push(me);
+        }
+        for s in self.streams.vreemd() {
+            if !s.kind.is_geluid() && !deelt.contains(&s.eigenaar) {
+                deelt.push(s.eigenaar);
+            }
+        }
+
+        self.gebruik.tik(&in_voice, &deelt);
+
+        if self
+            .overzicht_van
+            .is_none_or(|t| t.elapsed() >= OVERZICHT_INTERVAL)
+        {
+            self.overzicht_van = Some(Instant::now());
+            self.gebruik.bewaar();
+            match self.chat.alle_ops() {
+                Ok(ops) => {
+                    let o = self.gebruik.overzicht(
+                        &ops,
+                        &self.chat.timeline().wordle,
+                        gebruik::VENSTER_DAGEN,
+                    );
+                    self.overzicht = Arc::new(o);
+                }
+                Err(e) => tracing::warn!(error = %e, "oplog niet te lezen voor de terugblik"),
+            }
+        }
+    }
+
+    /// Op elke tik: staat het raadsel van vandaag er nog niet, dan halen we het op.
+    /// `moet_ophalen` houdt zelf bij dat dat hoogstens één keer per kwartier gebeurt, dus
+    /// dit is in rust een maplookup en niets meer.
+    fn wordle_tick(&mut self) {
+        if let Some(datum) = self.wordle.moet_ophalen() {
+            let tx = self.file_tx.clone();
+            tokio::spawn(wordle_taak(datum, false, tx));
+        }
+    }
+
+    /// Het `+`-menu: zet de kaart van vandaag in het algemene kanaal, voor iedereen.
+    ///
+    /// Twee gevallen, en het tweede is waar dit voor bestaat:
+    ///
+    /// - **Het raadsel staat er al.** Dan meteen de op, en klaar.
+    /// - **Het raadsel ontbreekt** (jouw ophaal is mislukt). Dan eerst halen — buiten de
+    ///   kwartierklok om, want daarom druk je erop — en pas aankondigen als hij binnen is.
+    ///   Aankondigen wat we zelf niet hebben zou een kaart zonder nummer opleveren die
+    ///   niemand kan spelen. Lukt het halen niet, dan komt de reden in het venster; de
+    ///   automatische poging blijft stil, deze niet, want hier staat iemand te kijken.
+    ///
+    /// Tweemaal drukken is geen probleem: de log houdt per dag de eerste kaart (invariant
+    /// 6, en `fitcom_store::WordleCardEntry` legt uit hoe).
+    fn wordle_in_chat(&mut self) {
+        match self.wordle.nu_ophalen() {
+            // Niets te halen betekent op deze plek: we hebben hem al.
+            None => self.kondig_wordle_aan(),
+            Some(datum) => {
+                tracing::info!(datum, "wordle handmatig opgevraagd om in de chat te zetten");
+                self.wordle_aankondigen = true;
+                let tx = self.file_tx.clone();
+                tokio::spawn(wordle_taak(datum, true, tx));
+            }
+        }
+    }
+
+    /// De op die de kaart bij iedereen in de tijdlijn zet. Doet niets zonder raadsel — dan
+    /// is er geen dagnummer om mee te sturen.
+    fn kondig_wordle_aan(&mut self) {
+        let dag = self.wordle.huidige_dag();
+        let Some(nummer) = self.wordle.nummer_van(dag) else {
+            return;
+        };
+        tracing::info!(dag, nummer, "wordle-kaart in de chat gezet");
+        let r = self.chat.zet_wordle_kaart(dag, nummer);
+        self.verwerk(r);
+    }
+
+    /// Bij het starten: staat er een afgerond spel van vandaag op schijf waarvan de uitslag
+    /// niet in de log zit, dan komt hij er alsnog in. Zelfde gedachte als `zet_naam`, dat
+    /// ook elke start controleert of de log klopt met wat hier waar is.
+    fn wordle_inhaalslag(&mut self) {
+        if let Some((dag, pogingen, gewonnen, patroon, seconden)) = self.wordle.te_melden() {
+            let r = self
+                .chat
+                .meld_wordle(dag, pogingen, gewonnen, patroon, seconden);
+            self.verwerk(r);
+        }
+    }
+
+    /// Leegt `pictures_dir`. Faalt een los bestand (bijvoorbeeld nog in gebruik), dan
+    /// gaat de rest gewoon door — net als bij offline peers is dit geen foutpad om op
+    /// vast te lopen. Een download of upload die net onderweg is naar/van een van deze
+    /// paden krijgt de al bestaande "bronbestand verdwenen"-afhandeling; zie `files.rs`.
+    fn verwijder_alle_afbeeldingen(&mut self) {
+        let lezing = match std::fs::read_dir(&self.pictures_dir) {
+            Ok(l) => l,
+            Err(e) => {
+                tracing::warn!(error = %e, "picturesmap niet te lezen");
+                return;
+            }
+        };
+        let mut verwijderd = 0u32;
+        for entry in lezing.flatten() {
+            let pad = entry.path();
+            // Een `.part` is een download die nu bezig is (die staat sinds beslissing 32
+            // hier en niet meer in de downloadmap). Die weggooien maakt van "ruim mijn
+            // afbeeldingen op" een mislukte overdracht, en dat vroeg niemand.
+            if pad.extension().is_some_and(|e| e == "part") {
+                continue;
+            }
+            if pad.is_file() {
+                match std::fs::remove_file(&pad) {
+                    Ok(()) => verwijderd += 1,
+                    Err(e) => {
+                        tracing::warn!(pad = %pad.display(), error = %e, "afbeelding niet te verwijderen")
+                    }
+                }
+            }
+        }
+        tracing::info!(verwijderd, "picturesmap opgeschoond");
+    }
+
+    /// Maakt van een gekozen plaatje de eigen profielfoto (of haalt hem weg) en legt dat
+    /// vast als `SetAvatar`-op. Een plaatje dat niet te lezen is wordt een melding.
+    fn zet_avatar(&mut self, pad: Option<&Path>) {
+        let bytes = match pad.map(crate::avatar::maak).transpose() {
+            Ok(b) => b.unwrap_or_default(),
+            Err(e) => {
+                tracing::warn!(error = %format!("{e:#}"), "profielfoto maken mislukt");
+                self.fout = Some(format!("Profile picture: {e:#}"));
+                return;
+            }
+        };
+        match self.chat.zet_avatar(bytes) {
+            Ok(cmds) => self.stuur_alles(cmds),
+            Err(e) => tracing::error!(error = %format!("{e:#}"), "profielfoto vastleggen mislukt"),
+        }
+    }
+
+    /// Zet de profielfoto's uit de tijdlijn op schijf, maar alleen als die tijdlijn nieuw is.
+    fn werk_avatars_bij(&mut self) {
+        let timeline = self.chat.timeline_arc();
+        if self.avatars_van.ptr_eq(&Arc::downgrade(&timeline)) {
+            return;
+        }
+        self.avatars_van = Arc::downgrade(&timeline);
+        self.avatars = timeline
+            .avatars
+            .iter()
+            .filter_map(|(p, b)| Some((*p, crate::avatar::op_schijf(&self.avatar_dir, b)?)))
+            .collect();
+    }
+
+    /// Legt een nieuwe weergavenaam vast: eerst in `config.toml` (zodat hij de volgende
+    /// start meteen weer klopt), dan als `SetNick`-op zodat de andere peers hem zien.
+    /// Een lege of ongewijzigde naam doet niets — `chat.zet_naam` dedupliceert dat laatste
+    /// zelf al, dus de log groeit hier niet van bij een dubbelklik op "opslaan".
+    fn zet_naam(&mut self, naam: &str) {
+        let naam = naam.trim();
+        if naam.is_empty() {
+            return;
+        }
+        // B-43: de oplog weigert een bijnaam boven `MAX_NAAM_LEN` *bytes*. Hier klemmen in
+        // plaats van daar laten falen, want anders zou een te lange naam uit een
+        // handgeschreven `config.toml` bij élke start opnieuw stuklopen en nooit
+        // propageren — een foutmelding die je niet kunt wegnemen zonder het bestand te
+        // bewerken. Klemmen gebeurt op een char-grens: midden in een multibyte-teken
+        // knippen levert geen geldige `String` op (en 16 emoji zitten al op 64 bytes).
+        let naam: String = if naam.len() > fitcom_proto::op::MAX_NAAM_LEN {
+            let geknipt: String = naam
+                .char_indices()
+                .take_while(|(i, c)| i + c.len_utf8() <= fitcom_proto::op::MAX_NAAM_LEN)
+                .map(|(_, c)| c)
+                .collect();
+            tracing::warn!(
+                bytes = naam.len(),
+                max = fitcom_proto::op::MAX_NAAM_LEN,
+                "weergavenaam afgekapt"
+            );
+            geknipt
+        } else {
+            naam.to_string()
+        };
+        let naam = naam.as_str();
+        self.cfg.display_name = naam.to_string();
+        if let Err(e) = self.cfg.save(&self.config_path) {
+            tracing::warn!(error = %format!("{e:#}"), "naam niet opgeslagen in config");
+            self.fout = Some(format!("naam opslaan: {e:#}"));
+        }
+        let r = self.chat.zet_naam(naam);
+        self.verwerk(r);
+        self.werk_uitnodiging_bij();
+    }
+
+    /// De eigen code opnieuw opbouwen uit `PeerId`, sleutel, naam en de eigen adressen.
+    fn werk_uitnodiging_bij(&mut self) {
+        self.uitnodiging = fitcom_proto::uitnodiging::Uitnodiging {
+            peer_id: self.chat.me(),
+            public_key: self.mesh.public_key,
+            naam: self.cfg.display_name.clone(),
+            adressen: self.eigen_adressen.clone(),
+        }
+        .code();
+    }
+
+    /// Codes uit geplakte tekst: elke peer erbij of bijgewerkt, en dan één keer de config
+    /// wegschrijven. Zie `crate::codes` voor de regel welke peer bij een code hoort.
+    fn voeg_codes_toe(&mut self, tekst: &str) {
+        let mut uitslag = CodesUitslag::default();
+        // Meer dan dit in één keer plakken is geen groep vrienden meer.
+        const MAX_CODES: usize = 16;
+        let mut gevonden = fitcom_proto::uitnodiging::Uitnodiging::vind_in(tekst);
+        gevonden.truncate(MAX_CODES);
+        uitslag.geen_code = gevonden.is_empty();
+        for code in gevonden {
+            let u = match code {
+                Ok(u) => u,
+                Err(e) => {
+                    uitslag
+                        .geweigerd
+                        .push((String::new(), CodeWeigering::Onleesbaar(e)));
+                    continue;
+                }
+            };
+            let naam = u.naam.clone();
+            match self.neem_code(u) {
+                Ok(true) => uitslag.toegevoegd.push(naam),
+                Ok(false) => uitslag.bijgewerkt.push(naam),
+                Err(w) => uitslag.geweigerd.push((naam, w)),
+            }
+        }
+        if !uitslag.toegevoegd.is_empty() || !uitslag.bijgewerkt.is_empty() {
+            if let Err(e) = self.cfg.save(&self.config_path) {
+                self.fout = Some(format!("config opslaan: {e:#}"));
+            }
+        }
+        tracing::info!(
+            toegevoegd = uitslag.toegevoegd.len(),
+            bijgewerkt = uitslag.bijgewerkt.len(),
+            geweigerd = uitslag.geweigerd.len(),
+            "uitnodigingscodes verwerkt"
+        );
+        self.codes_uitslag = Some(uitslag);
+    }
+
+    /// Alles wat bij een verbonden peer hoort opruimen: hij viel weg of werd verwijderd.
+    fn peer_weg(&mut self, id: PeerId) {
+        self.verbonden.remove(&id);
+        // Weg is weg: uit het gesprek halen, anders blijven we audio naar een dood adres
+        // sturen. Wegvallen klinkt hetzelfde als weggaan — voor wie meepraat is dat hetzelfde.
+        if self.peers_in_voice.remove(&id) {
+            self.geluid(geluid::Geluid::PeerLeave);
+        }
+        // Zijn vluchtige statussen zijn ze ook waard: een typindicatie van een peer die er
+        // niet meer is klopt per definitie niet.
+        self.typing_tot.retain(|(p, _), _| *p != id);
+        self.peer_status.remove(&id);
+        self.peer_activiteit.remove(&id);
+        self.peer_voice.remove(&id);
+        let (cmds, acties) = self.streams.bij_verbreking(id);
+        self.stuur_alles(cmds);
+        self.voer_uit(acties);
+    }
+
+    /// Mesh eerst: neemt hij het niet aan, dan blijft de peer ook hier staan. De mesh meldt
+    /// nog een laatste `Offline`, maar opruimen gebeurt hier al: daarna is de `PeerId` van
+    /// deze plek weg, zodat een opnieuw toegevoegde peer niet op de grafsteen terechtkomt.
+    fn verwijder_peer(&mut self, plek: usize) {
+        if !self.cfg.peers.get(plek).is_some_and(|p| !p.verwijderd) {
+            return;
+        }
+        if self
+            .mesh
+            .commands
+            .try_send(MeshCommand::Vergeet(plek))
+            .is_err()
+        {
+            self.fout =
+                Some("peer verwijderen: de verbindingslaag is bezet, probeer het opnieuw".into());
+            return;
+        }
+        self.cfg.peers[plek].vergeet();
+        if let Some(id) = self.peers[plek].peer_id.take() {
+            self.peer_weg(id);
+        }
+        if let Err(e) = self.cfg.save(&self.config_path) {
+            self.fout = Some(format!("config opslaan: {e:#}"));
+        }
+        tracing::info!(plek, "peer verwijderd");
+    }
+
+    /// Eén code toepassen. `Ok(true)`: een nieuwe peer; `Ok(false)`: een bestaande bijgewerkt.
+    ///
+    /// Config, mesh en `self.peers` houden dezelfde volgorde aan: het targetnummer van de
+    /// mesh is de plek in `cfg.peers`. Neemt de mesh het niet aan, dan verandert er dus ook
+    /// hier niets.
+    fn neem_code(
+        &mut self,
+        mut u: fitcom_proto::uitnodiging::Uitnodiging,
+    ) -> std::result::Result<bool, CodeWeigering> {
+        // De naam komt van een andere pc: dezelfde schoonmaak als een spelnaam van de draad.
+        u.naam = crate::speelt::schoon(&u.naam).unwrap_or_default();
+        let sleutel = release::bytes_naar_hex(&u.public_key);
+        match codes::koppel(&self.cfg.peers, self.chat.me(), &u)? {
+            Koppeling::Bestaand(i) => {
+                self.mesh
+                    .commands
+                    .try_send(MeshCommand::WerkBij {
+                        target: i,
+                        known_id: u.peer_id,
+                        public_key: u.public_key,
+                        kandidaten: if u.adressen.is_empty() {
+                            self.cfg.peers[i].addresses.clone()
+                        } else {
+                            u.adressen.clone()
+                        },
+                    })
+                    .map_err(|_| CodeWeigering::Bezet)?;
+                let p = &mut self.cfg.peers[i];
+                p.known_id = Some(u.peer_id);
+                p.public_key = Some(sleutel);
+                // Een code zonder adressen (gemaakt zonder netwerk) wist de werkende niet.
+                if !u.adressen.is_empty() {
+                    p.addresses = u.adressen;
+                }
+                if p.label.is_empty() {
+                    p.label = u.naam;
+                }
+                if let Some(v) = self.peers.get_mut(i) {
+                    v.peer_id = Some(u.peer_id);
+                }
+                Ok(false)
+            }
+            Koppeling::Nieuw => {
+                let label = if u.naam.is_empty() {
+                    "peer".to_string()
+                } else {
+                    u.naam
+                };
+                self.mesh
+                    .commands
+                    .try_send(MeshCommand::VoegToe(fitcom_net::PeerTarget {
+                        address: String::new(),
+                        label: label.clone(),
+                        known_id: Some(u.peer_id),
+                        control_port: config::DEFAULT_CONTROL_PORT,
+                        public_key: Some(u.public_key),
+                        kandidaten: u.adressen.clone(),
+                    }))
+                    .map_err(|_| CodeWeigering::Bezet)?;
+                let adres = u
+                    .adressen
+                    .first()
+                    .map(|a| a.to_string())
+                    .unwrap_or_default();
+                self.cfg.peers.push(config::PeerConfig {
+                    address: String::new(),
+                    label: label.clone(),
+                    known_id: Some(u.peer_id),
+                    control_port: config::DEFAULT_CONTROL_PORT,
+                    public_key: Some(sleutel),
+                    addresses: u.adressen,
+                    verwijderd: false,
+                });
+                self.peers
+                    .push(PeerView::nieuw(label, adres, Some(u.peer_id)));
+                Ok(true)
+            }
+        }
+    }
+
+    /// Schrijft de padkaarten van `files` naar schijf. Zie [`PadenIndex`] voor het
+    /// waarom; falen is nooit fataal — dan werkt "openen" deze sessie nog wel en na een
+    /// herstart niet meer.
+    fn bewaar_paden(&self) {
+        let (aangeboden, gedownload) = self.files.paden();
+        if let Err(e) = schrijf_paden_index(&self.paden_index, aangeboden, gedownload) {
+            tracing::warn!(error = %format!("{e:#}"), "bestandspaden niet opgeslagen");
+        }
+    }
+
+    /// Laat de onthouden paden een verhuisde afbeeldingenmap volgen, en schrijft ze weg.
+    /// Zonder dit wijst `Files::aangeboden` na een verhuizing naar bestanden die er niet
+    /// meer zijn, en kan een peer een afbeelding die wij aanbieden niet meer ophalen.
+    fn verhuis_padkaarten(&mut self, van: &Path, naar: &Path) {
+        let verhuis = |m: &HashMap<OpId, PathBuf>| -> HashMap<OpId, PathBuf> {
+            m.iter()
+                .map(|(id, p)| (*id, verhuisd_pad(p, van, naar)))
+                .collect()
+        };
+        let (aangeboden, gedownload) = self.files.paden();
+        let (aangeboden, gedownload) = (verhuis(aangeboden), verhuis(gedownload));
+        self.files.herstel_paden(aangeboden, gedownload);
+        self.bewaar_paden();
+    }
+
+    /// Start (of hervat) een download. Het hervatpunt komt van wat er al op schijf staat
+    /// van een eerdere, onderbroken poging.
+    fn download_bestand(&mut self, file: OpId) {
+        let Some(entry) = self
+            .chat
+            .timeline()
+            .files
+            .iter()
+            .find(|f| f.id == file)
+            .cloned()
+        else {
+            return;
+        };
+        if entry.author == self.chat.me() {
+            return; // ons eigen aanbod; er valt niets te downloaden
+        }
+        // Al onderweg: een tweede aanvraag levert een tweede uploadstream op, en die zou
+        // in hetzelfde halve bestand schrijven als de eerste. De knop staat tijdens een
+        // download uit, maar twee klikken vóór de eerste toestandswijziging het venster
+        // bereikt halen dat in. Hervatten na een mislukte poging kan wel: dat is
+        // `Mislukt`, niet `Bezig`.
+        if matches!(self.files.status(file), Some(DownloadStatus::Bezig { .. })) {
+            return;
+        }
+
+        let deelpad = deelpad_van(&entry, &self.downloads_dir, &self.pictures_dir);
+        let bestaand = std::fs::metadata(&deelpad).map(|m| m.len()).unwrap_or(0);
+
+        let cmd = self.files.download_aanvragen(&entry, bestaand);
+        self.stuur_alles(vec![cmd]);
+    }
+
+    fn start_upload(&mut self, actie: StartUpload) {
+        let mesh_commands = self.mesh.commands.clone();
+        tokio::spawn(upload_taak(
+            mesh_commands,
+            actie.naar,
+            actie.file,
+            actie.pad,
+            actie.vanaf,
+        ));
+    }
+
+    /// Leest eerst het kind-byte van een inkomende uni-stream en stuurt hem dan naar het
+    /// bestandspad. Zie `fitcom_net::filestream::read_kind`.
+    ///
+    /// B-04: `van` en de lijst lopende downloads gaan mee. Zonder die twee was elke
+    /// inkomende stream goed genoeg zolang er érgens een op met die `OpId` bestond, en dat
+    /// maakte ongevraagd wegschrijven mogelijk. De lijst wordt hier gekopieerd omdat de
+    /// taak `self` niet mag vasthouden; hij is een momentopname van "waar wachten wij nu
+    /// op", en dat is precies de vraag die telt op het moment dat de stream binnenkomt.
+    fn start_incoming_stream(&mut self, van: PeerId, stream: RecvStream) {
+        let downloads_dir = self.downloads_dir.clone();
+        let pictures_dir = self.pictures_dir.clone();
+        let timeline = self.chat.timeline_arc();
+        let events = self.file_tx.clone();
+        let verwacht = self.files.lopende_downloads();
+        tokio::spawn(dispatch_inkomende_stream(
+            van,
+            stream,
+            downloads_dir,
+            pictures_dir,
+            timeline,
+            verwacht,
+            events,
+        ));
+    }
+
+    fn op_file_event(&mut self, ev: FileEvent) {
+        match ev {
+            FileEvent::AanbodMislukt { pad } => {
+                if self.clip_aangeboden.as_deref() == Some(pad.as_path()) {
+                    self.clip_aangeboden = None;
+                }
+            }
+            FileEvent::NieuwAanbod {
+                pad,
+                naam,
+                grootte,
+                hash,
+                channel,
+            } => match self.chat.deel_bestand(&naam, grootte, hash, channel) {
+                Ok((id, cmds)) => {
+                    self.files.biedt_aan(id, pad);
+                    self.bewaar_paden();
+                    self.stuur_alles(cmds);
+                }
+                Err(e) => {
+                    tracing::error!(error = %format!("{e:#}"), "bestand aanbieden mislukt");
+                    self.fout = Some(format!("bestand aanbieden: {e:#}"));
+                }
+            },
+            FileEvent::Voortgang { file, ontvangen } => {
+                self.files.zet_voortgang(file, ontvangen);
+            }
+            FileEvent::Voltooid { file, pad } => {
+                self.files.zet_status(file, DownloadStatus::Voltooid);
+                self.files.is_gedownload(file, pad);
+                self.bewaar_paden();
+            }
+            FileEvent::Mislukt { file, bericht } => {
+                tracing::warn!(?file, %bericht, "bestandsoverdracht mislukt");
+                self.files
+                    .zet_status(file, DownloadStatus::Mislukt(bericht));
+            }
+            FileEvent::UpdateGestart { versie, totaal } => {
+                tracing::info!(?versie, %totaal, "nieuwere versie in de release-feed; ophalen");
+                self.updates.gestart(versie, totaal);
+            }
+            FileEvent::UpdateVoortgang { ontvangen } => self.updates.voortgang(ontvangen),
+            FileEvent::GeenUpdate => self.updates.niets_gevonden(),
+            FileEvent::UpdateKlaar { pad, hash } => self.updates.klaar(pad, hash),
+            FileEvent::UpdateMislukt { bericht } => {
+                tracing::warn!(%bericht, "update ophalen mislukt");
+                self.updates.mislukt(bericht);
+            }
+            FileEvent::WordleGeladen(raadsel) => {
+                tracing::info!(
+                    dag = raadsel.dag,
+                    nummer = raadsel.nummer,
+                    "wordle van vandaag binnen"
+                );
+                self.wordle.neem_op(raadsel);
+                // Stond de knop uit het +-menu hierop te wachten, dan kan de kaart nu.
+                if std::mem::take(&mut self.wordle_aankondigen) {
+                    self.kondig_wordle_aan();
+                }
+            }
+            FileEvent::Bereik(b) => {
+                tracing::info!(bereik = %b, "bereikbaarheid gemeten");
+                self.bereik = Some(b);
+            }
+            FileEvent::WordleMislukt(reden) => {
+                self.wordle_aankondigen = false;
+                self.wordle.fout = Some(reden);
+            }
+        }
+    }
+
+    /// Biedt een bewaarde clip aan in het algemene kanaal, via dezelfde weg als elk ander
+    /// bestand (hashen op een losse taak, dan `FileMeta`). Alleen aanbieden: niemand haalt
+    /// een clip vanzelf op, want `is_afbeelding` is onwaar voor een mp4.
+    /// Dezelfde clip tweemaal aanbieden doet niets, ook niet na een klik op de knop.
+    fn deel_clip(&mut self, pad: &Path) {
+        if self.clip_aangeboden.as_deref() == Some(pad) {
+            return;
+        }
+        if !pad.is_file() {
+            self.fout = Some("De clip staat niet meer op schijf.".into());
+            return;
+        }
+        self.clip_aangeboden = Some(pad.to_path_buf());
+        let tx = self.file_tx.clone();
+        let pictures_dir = self.pictures_dir.clone();
+        tokio::spawn(hash_en_bied_aan(
+            pad.to_path_buf(),
+            Channel::GENERAL,
+            pictures_dir,
+            tx,
+        ));
+    }
+
+    fn stuur_alles(&mut self, cmds: Vec<MeshCommand>) {
+        for cmd in cmds {
+            if let Err(e) = self.mesh.commands.try_send(cmd) {
+                tracing::warn!(error = %e, "netwerkcommando niet verstuurd");
+            }
+        }
+    }
+
+    /// Een kort geluidje bij iets dat je anders alleen ziet als je op dat moment naar het
+    /// venster kijkt: iemand die het gesprek in of uit gaat, of een stream die aan of uit
+    /// gaat.
+    ///
+    /// Niet-storen zet ze uit. Dat is dezelfde regel als voor meldingen, en om dezelfde
+    /// reden: deze geluidjes zijn onderbrekingen, en dat is precies waar die stand voor is.
+    /// Mute en deafen doen hier níéts: die gaan over het gesprek, niet over de app.
+    fn geluid(&self, g: geluid::Geluid) {
+        if self.niet_storen {
+            return;
+        }
+        self.speel_geluid(g);
+    }
+
+    /// Hetzelfde, maar zonder de niet-storencontrole: voor de proefknop in de instellingen.
+    /// Wie daarop drukt vraagt erom, en een knop die in niet-storen niets doet leest als
+    /// een stukke knop.
+    fn speel_geluid(&self, g: geluid::Geluid) {
+        geluid::speel(self.geluidset(), g, self.cfg.sound.volume);
+    }
+
+    /// De gekozen set uit de config. Een onbekende naam — een config van een nieuwere
+    /// build, of een typefout van de hand — valt terug op de standaard in plaats van
+    /// stilte, want stilte is niet te onderscheiden van "de geluidjes zijn stuk".
+    fn geluidset(&self) -> geluid::Geluidset {
+        geluid::Geluidset::van_naam(&self.cfg.sound.set).unwrap_or_else(|| {
+            tracing::warn!(gekozen = %self.cfg.sound.set, "onbekende geluidset in de config; standaard gebruikt");
+            geluid::Geluidset::STANDAARD
+        })
+    }
+
+    /// Hoeveel *zichtbare* streams (scherm, venster of camera) deze peer op dit moment
+    /// aanbiedt. Bureaubladgeluid telt niet mee: dat gaat automatisch met een scherm mee
+    /// en is geen aparte gebeurtenis.
+    ///
+    /// Gebruikt om aan het verschil vóór en ná een control-bericht te zien of er echt iets
+    /// aan of uit ging. Aan de aankondiging zelf is dat niet te zien: die komt bij elke
+    /// herverbinding opnieuw langs, en dan hoort er geen geluidje bij.
+    fn zichtbare_streams_van(&self, peer: PeerId) -> usize {
+        self.streams
+            .vreemd()
+            .iter()
+            .filter(|s| s.eigenaar == peer && s.kind.is_beeld())
+            .count()
+    }
+
+    /// Beslist of een net binnengekomen, live bericht een Windows-melding waard is.
+    /// Alleen bij een geldige tag naar jezelf — nooit bij elk bericht, en nooit in
+    /// niet-storenmodus, ongeacht de inhoud. Geldt gelijk voor het algemene kanaal en
+    /// een DM: een DM is niet vanzelf een melding waard, net zomin als een gewoon
+    /// bericht in het algemene kanaal dat is.
+    fn overweeg_melding(&mut self, van: PeerId, body: &str) {
+        if self.niet_storen || self.voorgrond.load(Ordering::Relaxed) {
+            return;
+        }
+        let eigen_naam = self.eigen_weergavenaam();
+        if tags::bevat_tag(body, &eigen_naam) {
+            self.meld_nieuw_bericht(van, body);
+        }
+    }
+
+    /// De weergavenaam waarop een tag naar "jezelf" gecontroleerd wordt: de naam zoals
+    /// die in de oplog staat (kan afwijken van `cfg.display_name` vlak na een
+    /// naamswijziging die nog niet verwerkt is), met de configwaarde als terugval.
+    fn eigen_weergavenaam(&self) -> String {
+        self.chat
+            .timeline()
+            .nicknames
+            .get(&self.chat.me())
+            .cloned()
+            .unwrap_or_else(|| self.cfg.display_name.clone())
+    }
+
+    /// Toont een Windows-melding voor een bericht dat al bevestigd is als meldingswaardig.
+    fn meld_nieuw_bericht(&mut self, van: PeerId, tekst: &str) {
+        let naam = self
+            .chat
+            .timeline()
+            .nicknames
+            .get(&van)
+            .cloned()
+            .unwrap_or_else(|| van.to_string()[..8].to_string());
+        notify::nieuw_bericht(&naam, tekst);
+    }
+
+    /// "Ik ben aan het typen" naar de anderen sturen, hooguit één keer per
+    /// `TYPING_THROTTLE` per kanaal. Een DM gaat — net als een DM-bericht zelf —
+    /// uitsluitend naar de geadresseerde.
+    fn stuur_typing(&mut self, channel: Channel) {
+        let nu = Instant::now();
+        match self.typing_verzonden.get(&channel) {
+            Some(t) if nu.duration_since(*t) < TYPING_THROTTLE => return,
+            _ => {}
+        }
+        self.typing_verzonden.insert(channel, nu);
+        let cmd = match channel.dm_peer() {
+            Some(naar) => MeshCommand::Send {
+                to: naar,
+                msg: ControlMsg::Typing(Typing { channel }),
+            },
+            None => MeshCommand::Broadcast(ControlMsg::Typing(Typing { channel })),
+        };
+        self.stuur_alles(vec![cmd]);
+    }
+
+    /// Eén meting van het voorgrondvenster op een trage tik, met de wisselbewaking van
+    /// `speelt::Rust`. Alleen een bevestigde wissel gaat over de draad. Staat het delen uit,
+    /// dan wordt er niet eens gemeten.
+    fn meet_activiteit(&mut self) {
+        if !self.cfg.share_activity {
+            return;
+        }
+        let nu = Instant::now();
+        if !crate::speelt::is_aan_de_beurt(self.speelt_gemeten, nu) {
+            return;
+        }
+        self.speelt_gemeten = Some(nu);
+        let waarneming = self.speelt_zoeker.voorgrond_spel();
+        if let Some(nieuw) = self.speelt_rust.meet(waarneming) {
+            tracing::debug!(spel = ?nieuw, "voorgrondspel gewijzigd");
+            self.stuur_activiteit(nieuw.unwrap_or_default());
+        }
+    }
+
+    fn stuur_activiteit(&mut self, name: String) {
+        let cmds = self
+            .verbonden
+            .keys()
+            .copied()
+            .map(|to| MeshCommand::Send {
+                to,
+                msg: ControlMsg::Activity(Activity { name: name.clone() }),
+            })
+            .collect();
+        self.stuur_alles(cmds);
+    }
+
+    /// Eigen status wisselen en iedereen op de hoogte brengen. Vluchtig: er zit geen op
+    /// achter, dus wie offline was ziet de wisseling pas na zijn verbinding — daarom de
+    /// extra melding bij het opkomen van een verbinding hierboven.
+    fn zet_status(&mut self, status: u8) {
+        let status = UserStatusValue(status);
+        if !status.is_known() || status == self.eigen_status {
+            return;
+        }
+        self.eigen_status = status;
+        let cmds = self
+            .verbonden
+            .keys()
+            .copied()
+            .map(|to| MeshCommand::Send {
+                to,
+                msg: ControlMsg::UserStatus(UserStatus { status }),
+            })
+            .collect();
+        self.stuur_alles(cmds);
+    }
+
+    fn verwerk(&mut self, r: Result<Vec<MeshCommand>>) {
+        match r {
+            Ok(cmds) => self.stuur_alles(cmds),
+            Err(e) => {
+                tracing::error!(error = %format!("{e:#}"), "chat-actie mislukt");
+                self.fout = Some(format!("{e:#}"));
+            }
+        }
+    }
+
+    fn publiceer(&mut self) {
+        self.werk_avatars_bij();
+        let niveaus = self.voice.as_ref().map(|v| v.niveaus()).unwrap_or_default();
+
+        // Het volume in het menu van elk kijkvenster; de handle stuurt alleen een wijziging.
+        let volumes: Vec<_> = self
+            .kijkers
+            .keys()
+            .map(|&(e, id)| ((e, id), self.geluid_bij_beeld(e, id).map(|g| g.1)))
+            .collect();
+        for (sleutel, vol) in volumes {
+            if let Some(k) = self.kijkers.get_mut(&sleutel) {
+                k.zet_volume(vol);
+            }
+        }
+
+        // Een verwijderde peer verdwijnt overal: leden, DM's, gesprek, Network. Zijn ops blijven
+        // in de store (invariant 6).
+        let mut peers: Vec<PeerView> = self
+            .peers
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !self.cfg.peers.get(*i).is_some_and(|c| c.verwijderd))
+            .map(|(plek, p)| PeerView { plek, ..p.clone() })
+            .collect();
+        for p in &mut peers {
+            if let Some(id) = p.peer_id {
+                p.in_voice = self.peers_in_voice.contains(&id);
+                if let Some(s) = self.peer_voice.get(&id).filter(|_| p.in_voice) {
+                    (p.muted, p.deafened) = (s.muted, s.deafened);
+                }
+                p.niveau = niveaus.per_peer.get(&id).copied().unwrap_or(0.0);
+                p.spreekt = niveaus.spreekt.contains(&id);
+                // Alleen tonen zolang hij er ook is; een status van een offline peer
+                // is tegen de tijd dat hij terugkomt toch verlopen.
+                if self.verbonden.contains_key(&id) {
+                    p.user_status = self.peer_status.get(&id).copied();
+                    p.activiteit = self.peer_activiteit.get(&id).cloned();
+                }
+            }
+        }
+
+        let voice = VoiceView {
+            actief: self.voice.is_some(),
+            muted: self.voice.as_ref().is_some_and(|v| v.is_mute()),
+            deafened: self.voice.as_ref().is_some_and(|v| v.is_deafen()),
+            eigen_niveau: niveaus.eigen,
+            eigen_spreekt: niveaus.eigen_spreekt,
+        };
+
+        let eigen_streams = self
+            .streams
+            .eigen()
+            .iter()
+            .map(|s| EigenStreamView {
+                stream_id: s.id,
+                titel: s.titel.clone(),
+                kijkers: s.kijkers.len(),
+                is_geluid: s.kind.is_geluid(),
+                is_muziek: s.kind == StreamKind::MUSIC,
+                is_camera: s.kind == StreamKind::CAMERA,
+                miniatuur: self.delers.get(&s.id).and_then(|d| d.miniatuur()),
+                tekening: s.tekening.clone(),
+                bedienen: s.bediening.mag,
+                vrager: s.bediening.vrager.map(|(v, _)| v),
+                bediener: s.bediening.bediener,
+                kan_bedienen: BEDIENEN_KAN && s.kind == StreamKind::MONITOR,
+            })
+            .collect();
+
+        let streams = self
+            .streams
+            .vreemd()
+            .iter()
+            .map(|s| StreamView {
+                eigenaar: s.eigenaar,
+                stream_id: s.id,
+                titel: s.titel.clone(),
+                breedte: s.breedte,
+                hoogte: s.hoogte,
+                kijken: s.kijken,
+                is_geluid: s.kind.is_geluid(),
+                is_muziek: s.kind == StreamKind::MUSIC,
+                is_camera: s.kind == StreamKind::CAMERA,
+                volume: self
+                    .stream_volumes
+                    .get(&(s.eigenaar, s.id))
+                    .copied()
+                    .unwrap_or(1.0),
+                miniatuur: self.miniaturen.get(&(s.eigenaar, s.id)).cloned(),
+                tekening: s.tekening.clone(),
+            })
+            .collect();
+
+        let me = self.chat.me();
+        let files = self
+            .chat
+            .timeline()
+            .files
+            .iter()
+            .map(|f| FileView {
+                id: f.id,
+                author: f.author,
+                channel: f.channel,
+                name: f.name.clone(),
+                size: f.size,
+                is_mine: f.author == me,
+                status: self.files.status(f.id).cloned(),
+                lamport: f.lamport,
+                hash: f.hash,
+                local_path: self.files.lokaal_pad(f.id).map(Path::to_path_buf),
+            })
+            .collect();
+
+        let _ = self.snap_tx.send(Arc::new(Snapshot {
+            timeline: self.chat.timeline_arc(),
+            peers,
+            voice,
+            eigen_streams,
+            streams,
+            video: self.cfg.video.clone(),
+            geluid: self.cfg.sound.clone(),
+            push_to_talk: self.cfg.push_to_talk.clone(),
+            deel_activiteit: self.cfg.share_activity,
+            eigen_spel: self.speelt_rust.huidig().map(str::to_owned),
+            tekenen: self.cfg.allow_drawing,
+            bedienen: self.cfg.allow_remote_control && BEDIENEN_KAN,
+            auto_popout: self.cfg.auto_popout,
+            popout_monitor: self.cfg.popout_monitor.clone(),
+            overlay: self.cfg.overlay.clone(),
+            input_device: self.cfg.input_device.clone(),
+            output_device: self.cfg.output_device.clone(),
+            download_dir: self.downloads_dir.clone(),
+            pictures_dir: self.pictures_dir.clone(),
+            avatars: self.avatars.clone(),
+            bereik: self.bereik.clone(),
+            files,
+            ongelezen: self.chat.ongelezen,
+            ongelezen_dm: self.chat.ongelezen_dm().clone(),
+            ongelezen_topic: self.chat.ongelezen_topic().clone(),
+            niet_storen: self.niet_storen,
+            clips: self.clips.aanwezig().then(|| {
+                let mut w = self.clips.weergave(&self.cfg.clips);
+                // Geen schijftoegang in een momentopname; `deel_clip` meldt een weggeraakte clip.
+                w.kaart =
+                    self.clip_kaart
+                        .as_ref()
+                        .map(|(p, at, grootte)| crate::clips::ClipKaart {
+                            at: *at,
+                            grootte: *grootte,
+                            gedeeld: self.clip_aangeboden.as_deref() == Some(p.as_path()),
+                        });
+                w.kan_delen = self
+                    .clips
+                    .laatste()
+                    .is_some_and(|p| self.clip_aangeboden.as_deref() != Some(p.as_path()));
+                w
+            }),
+            typing: self
+                .typing_tot
+                .iter()
+                .filter(|((p, _), _)| self.verbonden.contains_key(p))
+                .map(|((p, c), _)| (*c, *p))
+                .collect(),
+            eigen_status: self.eigen_status,
+            update: self.updates.status().cloned(),
+            uitnodiging: self.uitnodiging.clone(),
+            codes_uitslag: self.codes_uitslag.clone(),
+            wordle: WordleView {
+                dag: self.wordle.huidige_dag(),
+                bord: self.wordle.bord(),
+                nummers: self.wordle.bekende_dagen().collect(),
+                fout: self.wordle.fout.clone(),
+            },
+            overzicht: self.overzicht.clone(),
+            fout: self.fout.clone(),
+        }));
+    }
+}
+
+/// De regel van `bij_muziekbediening`, los zodat hij te testen is: wij delen precies deze
+/// muziekstream, wij zitten in het gesprek, de afzender ook, en de actie kennen we.
+fn mag_muziek_bedienen(
+    eigen_muziek: Option<u32>,
+    wij_in_gesprek: bool,
+    afzender_in_gesprek: bool,
+    m: &MusicControl,
+) -> bool {
+    eigen_muziek == Some(m.stream_id)
+        && wij_in_gesprek
+        && afzender_in_gesprek
+        && m.action.is_known()
+}
+
+#[cfg(test)]
+mod muziekbediening_tests {
+    use super::*;
+
+    #[test]
+    fn alleen_wie_in_het_gesprek_zit_bedient_onze_eigen_muziek() {
+        let m = |stream_id, action| MusicControl { stream_id, action };
+        let volgende = m(7, MusicAction::NEXT);
+        assert!(mag_muziek_bedienen(Some(7), true, true, &volgende));
+        assert!(mag_muziek_bedienen(
+            Some(7),
+            true,
+            true,
+            &m(7, MusicAction::PLAY_PAUSE)
+        ));
+        // Afzender niet in het gesprek: hoort de muziek niet, bedient hem ook niet.
+        assert!(!mag_muziek_bedienen(Some(7), true, false, &volgende));
+        // Wij zelf niet (meer) in het gesprek.
+        assert!(!mag_muziek_bedienen(Some(7), false, true, &volgende));
+        // We delen geen muziek, of een andere stream (een late klik na opnieuw delen).
+        assert!(!mag_muziek_bedienen(None, true, true, &volgende));
+        assert!(!mag_muziek_bedienen(Some(8), true, true, &volgende));
+        // Een actie van een nieuwere peer die we niet kennen.
+        assert!(!mag_muziek_bedienen(
+            Some(7),
+            true,
+            true,
+            &m(7, MusicAction(200))
+        ));
+    }
+}
+
+/// Namen van de beschikbare apparaten, voor het instellingenscherm.
+pub fn audio_apparaten() -> Result<(Vec<String>, Vec<String>)> {
+    fitcom_audio::session::apparaatnamen().context("geluidsapparaten opvragen")
+}
+
+/// Schermen en vensters die te delen zijn. Wordt bij het openen van het keuzemenu
+/// opgevraagd; vensters komen en gaan, dus een eenmalige lijst zou snel verouderen.
+pub fn deelbare_bronnen() -> Result<Vec<Bron>> {
+    fitcom_video::beschikbare_bronnen().context("deelbare bronnen opvragen")
+}
+
+// ---------------------------------------------------------------------------
+// Bestandsoverdracht: losse tokio-taken. Puur I/O en hashen, geen beslissingen —
+// die zitten in `files.rs`. Zie `docs/ARCHITECTURE.md` voor waarom de bulkbytes over
+// een eigen QUIC-stream gaan in plaats van over de control-stream.
+// ---------------------------------------------------------------------------
+
+/// De naam van het deelbestand (`.part`) op schijf tijdens het downloaden. Op basis
+/// van `(author, channel, seq)` in plaats van de leesbare naam: twee aanbiedingen met
+/// dezelfde bestandsnaam van verschillende peers mogen elkaar niet overschrijven. Het
+/// kanaal moet erbij sinds `seq` per (auteur, kanaal) telt in plaats van per auteur
+/// alleen — zonder dat zou een algemeen bestand, een DM-bestand en een bestand in een
+/// subkanaal van dezelfde auteur met toevallig dezelfde `seq` op dezelfde tijdelijke naam
+/// uitkomen.
+/// Waar het halve bestand tijdens het downloaden staat.
+///
+/// Voor een afbeelding in de afbeeldingenmap, want daar landt hij straks ook: dan is de
+/// laatste stap een hernoeming *binnen één map*. Dat is precies waarom deze functie
+/// bestaat — het was een verhuizing van de downloadmap naar de afbeeldingenmap, en die
+/// twee kunnen op verschillende schijven staan. `rename` kan dat niet (`os error 17` op
+/// Windows, `EXDEV` op unix), dus wie zijn downloadmap naar een andere schijf verzette
+/// kreeg geen enkele afbeelding meer binnen — alleen een foutmelding over hernoemen op de
+/// kaart in de chat. Zie `docs/ARCHITECTURE.md` beslissing 32.
+///
+/// Alle andere bestanden blijven in de downloadmap, waar ze ook blijven liggen.
+fn deelpad_van(entry: &FileEntry, downloads_dir: &Path, pictures_dir: &Path) -> PathBuf {
+    let dir = if files::is_afbeelding(&entry.name) {
+        pictures_dir
+    } else {
+        downloads_dir
+    };
+    dir.join(deelbestand_naam(entry))
+}
+
+fn deelbestand_naam(entry: &FileEntry) -> String {
+    let kanaal = if let Some(p) = entry.channel.dm_peer() {
+        format!("dm-{}", p.0.simple())
+    } else if let Some(t) = entry.channel.topic_id() {
+        format!("topic-{}", t.0.simple())
+    } else {
+        "algemeen".to_string()
+    };
+    format!("{}-{kanaal}-{}.part", entry.author.0.simple(), entry.id.seq)
+}
+
+/// B-03: maakt van een naam die van een peer komt een naam die gegarandeerd één
+/// bestandsnaam ís, en geen pad.
+///
+/// De reden dat dit bestaat: `FileEntry.name` is letterlijk overgenomen uit de op van de
+/// peer en `Path::join` normaliseert `..` niet. Op Windows vervangt een absoluut of rooted
+/// argument de basis zelfs volledig, dus `..\..\..\Startup\x.exe`,
+/// `C:\Users\...\Startup\x.exe` en `\\aanvaller\share\x` landden alle drie buiten de
+/// downloadmap — een exe in de Startup-map is code-uitvoering bij de volgende aanmelding,
+/// zonder dat de gebruiker ook maar iets aanklikt.
+///
+/// Waarom filteren en niet weigeren: een naam die niet door de beugel kan is geen reden om
+/// de overdracht te laten mislukken (dat zou een peer met een rare bestandsnaam onterecht
+/// stukmaken), maar wél om er een onschuldige naam van te maken.
+///
+/// De gereserveerde DOS-namen staan erbij omdat `CON`, `NUL` en `COM1` op Windows nog
+/// steeds apparaten zijn, ook mét extensie: schrijven naar `NUL.txt` schrijft naar het
+/// bit-vat in plaats van naar een bestand.
+fn veilige_bestandsnaam(naam: &str) -> String {
+    // `file_name()` haalt elk pad-voorvoegsel eraf; het filter daarna dekt de scheidingstekens
+    // die op het *andere* platform gelden (een Windows-peer die aan een mac levert, en
+    // andersom) plus wat NTFS toch al weigert.
+    let kaal = Path::new(naam)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+    let kaal: String = kaal
+        .chars()
+        .filter(|c| {
+            !matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') && !c.is_control()
+        })
+        .collect();
+    // Punten en spaties aan de randen: Windows kapt die zelf af, waardoor "evil.exe ." en
+    // "evil.exe" hetzelfde bestand zijn en een controle op de naam te omzeilen valt.
+    let kaal = kaal.trim_matches(|c: char| c == '.' || c == ' ');
+    const GERESERVEERD: &[&str] = &[
+        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+        "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+    ];
+    let stam = kaal.split('.').next().unwrap_or("").to_ascii_uppercase();
+    if kaal.is_empty() || GERESERVEERD.contains(&stam.as_str()) {
+        return "bestand".into();
+    }
+    // Afkappen op chars en niet op bytes: een multibyte-naam mag geen paniek geven.
+    kaal.chars().take(120).collect()
+}
+
+/// Waar de bytes van elk bestand op *deze* pc staan, over een herstart heen.
+///
+/// Puur lokaal: dit gaat nooit de draad op en is geen op. Het staat er omdat het pad niet
+/// te herleiden is uit wat wél gesynct wordt. Bij een aanbod is dat het bestand van de
+/// gebruiker zelf, ergens op schijf; bij een download de definitieve naam ná verificatie,
+/// die bij een botsing `naam (2).ext` is geworden. Zonder deze afdruk kon de UI na een
+/// herstart geen gedownload bestand meer openen, en — dat was al zo vóór dit bestand
+/// bestond — kon een andere peer een bestand dat jij aanbood niet meer ophalen zodra jij
+/// de app één keer had herstart.
+///
+/// JSON en geen TOML: de sleutel is een `OpId` (auteur + kanaal + seq) en dat is geen
+/// TOML-tabelnaam. Een lijst van paren dus, geen map.
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+struct PadenIndex {
+    #[serde(default)]
+    aangeboden: Vec<(OpId, PathBuf)>,
+    #[serde(default)]
+    gedownload: Vec<(OpId, PathBuf)>,
+}
+
+/// Leest de padkaarten terug. Elk pad dat er niet meer is valt af: een bestand dat de
+/// gebruiker intussen verplaatst of weggegooid heeft levert dan gewoon geen openknop op,
+/// in plaats van een knop die niets doet — en een aanbod dat wij niet meer kunnen leveren
+/// wordt weer eerlijk `NOT_AVAILABLE` in plaats van een upload die halverwege stukloopt.
+///
+/// `van`/`naar` is de verhuizing die [`verhuis_afbeeldingen`] net gedaan heeft: een pad
+/// dat nog naar de oude afbeeldingenmap wijst, wijst daarna naar de nieuwe. Dat moet
+/// *vóór* het wegfilteren gebeuren, anders valt precies wat we net verhuisd hebben eruit
+/// — en dan kan een peer een afbeelding die wij aanbieden niet meer ophalen.
+///
+/// Een ontbrekend of onleesbaar bestand is geen fout: dan is er niets te herstellen.
+fn lees_paden_index(
+    pad: &Path,
+    van: &Path,
+    naar: &Path,
+) -> (HashMap<OpId, PathBuf>, HashMap<OpId, PathBuf>) {
+    let Ok(tekst) = std::fs::read_to_string(pad) else {
+        return (HashMap::new(), HashMap::new());
+    };
+    let index: PadenIndex = match serde_json::from_str(&tekst) {
+        Ok(i) => i,
+        Err(e) => {
+            tracing::warn!(error = %e, pad = %pad.display(), "bestandspaden onleesbaar; genegeerd");
+            return (HashMap::new(), HashMap::new());
+        }
+    };
+    let bestaand = |paren: Vec<(OpId, PathBuf)>| -> HashMap<OpId, PathBuf> {
+        paren
+            .into_iter()
+            .map(|(id, p)| (id, verhuisd_pad(&p, van, naar)))
+            .filter(|(_, p)| p.exists())
+            .collect()
+    };
+    (bestaand(index.aangeboden), bestaand(index.gedownload))
+}
+
+/// `pad` met `van` als voorvoegsel vervangen door `naar`, of onveranderd als het pad daar
+/// niet onder valt. Zie [`verhuis_afbeeldingen`].
+fn verhuisd_pad(pad: &Path, van: &Path, naar: &Path) -> PathBuf {
+    match pad.strip_prefix(van) {
+        Ok(rest) => naar.join(rest),
+        Err(_) => pad.to_path_buf(),
+    }
+}
+
+/// Verhuist de content-adresseerbare afbeeldingen van `van` naar `naar`.
+///
+/// Nodig omdat het pad van een afbeelding *afgeleid* is en niet onthouden: het volgt uit
+/// de inhoudshash en uit waar de afbeeldingenmap nu staat (`config::resolve_pictures_dir`).
+/// Verandert die map — bij de overstap van de datamap naar de downloadmap, of doordat de
+/// gebruiker een andere downloadmap kiest — dan moeten de bestanden mee, anders staat elke
+/// afbeelding van gisteren op een pad dat niemand meer uitrekent en verdwijnt hij uit de
+/// tijdlijn.
+///
+/// Kopiëren-en-weggooien als `rename` niet lukt: dit is de ene plek waar de verhuizing
+/// wél over een schijfgrens kan gaan (van `%APPDATA%` naar `D:\Downloads`), en dat is
+/// precies wat `rename` niet kan. Een bestand dat niet mee wil, blijft staan en wordt
+/// gelogd; de rest gaat door. Doet niets als `van` en `naar` dezelfde map zijn of als er
+/// niets te verhuizen is — dat is het geval bij elke normale start.
+fn verhuis_afbeeldingen(van: &Path, naar: &Path) {
+    if van == naar || !van.is_dir() {
+        return;
+    }
+    let Ok(inhoud) = std::fs::read_dir(van) else {
+        return;
+    };
+    let mut verhuisd = 0usize;
+    for regel in inhoud.flatten() {
+        let bron = regel.path();
+        if !bron.is_file() {
+            continue;
+        }
+        let doel = naar.join(regel.file_name());
+        if doel.exists() {
+            // Dezelfde naam betekent dezelfde inhoud (het is de hash), dus dit is
+            // hetzelfde bestand en de oude kopie mag weg.
+            let _ = std::fs::remove_file(&bron);
+            continue;
+        }
+        let uitkomst = std::fs::rename(&bron, &doel).or_else(|_| {
+            std::fs::copy(&bron, &doel).map(|_| {
+                let _ = std::fs::remove_file(&bron);
+            })
+        });
+        match uitkomst {
+            Ok(()) => verhuisd += 1,
+            Err(e) => {
+                tracing::warn!(error = %e, bestand = %bron.display(), "afbeelding niet verhuisd")
+            }
+        }
+    }
+    if verhuisd > 0 {
+        tracing::info!(
+            aantal = verhuisd,
+            van = %van.display(),
+            naar = %naar.display(),
+            "afbeeldingen verhuisd naar de nieuwe afbeeldingenmap"
+        );
+    }
+    // Lukt dit niet, dan stond er nog iets in en is dat de volgende keer weer een poging.
+    let _ = std::fs::remove_dir(van);
+}
+
+fn schrijf_paden_index(
+    pad: &Path,
+    aangeboden: &HashMap<OpId, PathBuf>,
+    gedownload: &HashMap<OpId, PathBuf>,
+) -> Result<()> {
+    let index = PadenIndex {
+        aangeboden: aangeboden.iter().map(|(k, v)| (*k, v.clone())).collect(),
+        gedownload: gedownload.iter().map(|(k, v)| (*k, v.clone())).collect(),
+    };
+    let tekst = serde_json::to_string_pretty(&index).context("bestandspaden serialiseren")?;
+    // Via een tijdelijk bestand: een halve schrijfactie bij een stroomstoring mag geen
+    // onleesbare index achterlaten — en dan zou `lees_paden_index` bij de volgende start
+    // alles weggooien in plaats van één regel.
+    let tijdelijk = pad.with_extension("json.tmp");
+    std::fs::write(&tijdelijk, tekst).context("bestandspaden schrijven")?;
+    std::fs::rename(&tijdelijk, pad).context("bestandspaden op hun plek zetten")?;
+    Ok(())
+}
+
+/// De naam waaronder het bestand definitief landt. Voegt `" (2)"` etc. toe als de naam
+/// al bestaat — bijvoorbeeld omdat twee peers hetzelfde bestand aanboden.
+///
+/// B-03: `naam` komt van een peer, dus hij gaat eerst door [`veilige_bestandsnaam`]. Het
+/// resultaat ligt daarna per constructie onder `dir`, en de `debug_assert!` onderaan houdt
+/// dat zo als hier ooit iets bijkomt.
+fn unieke_bestandsnaam(dir: &Path, naam: &str) -> PathBuf {
+    let naam = veilige_bestandsnaam(naam);
+    let naam = naam.as_str();
+    let kandidaat = dir.join(naam);
+    if !kandidaat.exists() {
+        debug_assert!(kandidaat.starts_with(dir), "B-03: pad buiten de doelmap");
+        return kandidaat;
+    }
+
+    let pad = Path::new(naam);
+    let stam = pad.file_stem().and_then(|s| s.to_str()).unwrap_or(naam);
+    let ext = pad.extension().and_then(|s| s.to_str());
+    // B-44: `2u64..` in plaats van `2u32..`, zodat de `unreachable!()` hieronder ook bij een
+    // extreme naamcollisie onbereikbaar blijft in plaats van te overflowen. Kost niets.
+    for i in 2u64.. {
+        let naam_n = match ext {
+            Some(e) => format!("{stam} ({i}).{e}"),
+            None => format!("{stam} ({i})"),
+        };
+        let kandidaat = dir.join(&naam_n);
+        if !kandidaat.exists() {
+            debug_assert!(kandidaat.starts_with(dir), "B-03: pad buiten de doelmap");
+            return kandidaat;
+        }
+    }
+    unreachable!("dir.join blijft nieuwe paden opleveren")
+}
+
+/// Blake3-hash van een heel bestand, synchroon. Alleen aanroepen vanuit `spawn_blocking`.
+fn blake3_hash_bestand(pad: &Path) -> std::io::Result<(u64, [u8; 32])> {
+    let mut bestand = std::fs::File::open(pad)?;
+    let mut hasher = blake3::Hasher::new();
+    let grootte = std::io::copy(&mut bestand, &mut hasher)?;
+    Ok((grootte, *hasher.finalize().as_bytes()))
+}
+
+/// Leest een lokaal bestand, hasht het, en meldt het resultaat terug zodat de motor het
+/// als `FileMeta`-op kan vastleggen. Op een losse taak: bij een groot bestand kan dit
+/// seconden duren, en dat mag de UI niet blokkeren.
+async fn hash_en_bied_aan(
+    pad: PathBuf,
+    channel: Channel,
+    pictures_dir: PathBuf,
+    events: mpsc::Sender<FileEvent>,
+) {
+    let naam = pad
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "bestand".to_string());
+
+    let leespad = pad.clone();
+    let naam_voor_taak = naam.clone();
+    let resultaat =
+        tokio::task::spawn_blocking(move || -> std::io::Result<(u64, [u8; 32], PathBuf)> {
+            let (grootte, hash) = blake3_hash_bestand(&leespad)?;
+
+            // Een afbeelding krijgt een eigen, content-adresseerbare kopie in
+            // `pictures_dir` — daar leest de UI straks een miniatuur van, op precies
+            // hetzelfde pad dat een downloadende peer er ook voor gebruikt (zie
+            // `files::hash_bestandsnaam`). Het origineel blijft ongemoeid: dat is
+            // waarschijnlijk het bestand van de gebruiker zelf, ergens anders op schijf.
+            let aanbodpad = if files::is_afbeelding(&naam_voor_taak) {
+                let bestemming =
+                    pictures_dir.join(files::hash_bestandsnaam(&hash, &naam_voor_taak));
+                if bestemming != leespad && !bestemming.exists() {
+                    std::fs::copy(&leespad, &bestemming)?;
+                }
+                bestemming
+            } else {
+                leespad
+            };
+
+            Ok((grootte, hash, aanbodpad))
+        })
+        .await;
+
+    match resultaat {
+        Ok(Ok((grootte, hash, aanbodpad))) => {
+            let _ = events
+                .send(FileEvent::NieuwAanbod {
+                    pad: aanbodpad,
+                    naam,
+                    grootte,
+                    hash,
+                    channel,
+                })
+                .await;
+        }
+        Ok(Err(e)) => {
+            tracing::error!(error = %e, pad = %pad.display(), "bestand lezen voor aanbieden mislukt");
+            let _ = events.send(FileEvent::AanbodMislukt { pad }).await;
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "hash-taak voor aanbieden afgebroken");
+            let _ = events.send(FileEvent::AanbodMislukt { pad }).await;
+        }
+    }
+}
+
+/// Opent de uploadstream naar de aanvrager en stuurt het bestand vanaf `vanaf`. Fouten
+/// hier zijn alleen voor de logs: de aanvrager ziet gewoon geen bytes komen en kan het
+/// later opnieuw proberen.
+async fn upload_taak(
+    mesh_commands: mpsc::Sender<MeshCommand>,
+    naar: PeerId,
+    file: OpId,
+    pad: PathBuf,
+    vanaf: u64,
+) {
+    // Openen vóór de uploadstream aanvragen: `Files::verzoek_ontvangen` weet alleen dat we
+    // dit bestand ooit hebben aangeboden, niet of het nu nog op schijf staat. Blijkt het
+    // weg (verplaatst, verwijderd), dan corrigeren we hier alsnog naar `NotAvailable` in
+    // plaats van de aanvrager voor altijd op "bezig" te laten staan.
+    let mut bestand = match tokio::fs::File::open(&pad).await {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(error = %e, pad = %pad.display(), "bronbestand niet meer te openen");
+            let _ = mesh_commands
+                .send(MeshCommand::Send {
+                    to: naar,
+                    msg: ControlMsg::FileResponse(fitcom_proto::control::FileResponse {
+                        file,
+                        outcome: fitcom_proto::control::FileOutcome::NOT_AVAILABLE,
+                    }),
+                })
+                .await;
+            return;
+        }
+    };
+
+    let (tx, rx) = oneshot::channel();
+    if mesh_commands
+        .send(MeshCommand::OpenUploadStream {
+            to: naar,
+            respond: tx,
+        })
+        .await
+        .is_err()
+    {
+        return;
+    }
+    let stream = match rx.await {
+        Ok(Some(s)) => s,
+        _ => {
+            tracing::debug!(peer = ?naar, "kon geen uploadstream openen; peer waarschijnlijk weg");
+            return;
+        }
+    };
+
+    if let Err(e) = upload_bytes(stream, file, &mut bestand, vanaf).await {
+        tracing::warn!(error = %format!("{e:#}"), peer = ?naar, "bestandsupload mislukt");
+    }
+}
+
+async fn upload_bytes(
+    mut stream: SendStream,
+    file: OpId,
+    bestand: &mut tokio::fs::File,
+    vanaf: u64,
+) -> Result<()> {
+    fitcom_net::filestream::write_header(&mut stream, file).await?;
+
+    bestand
+        .seek(std::io::SeekFrom::Start(vanaf))
+        .await
+        .context("hervatpunt opzoeken in het bronbestand")?;
+    tokio::io::copy(bestand, &mut stream)
+        .await
+        .context("bytes versturen")?;
+    stream.finish().context("uploadstream afsluiten")?;
+    Ok(())
+}
+
+/// Leest het kind-byte van een inkomende bulk-stream en stuurt hem naar het bestandspad.
+/// Zie `fitcom_net::filestream::read_kind`.
+async fn dispatch_inkomende_stream(
+    van: PeerId,
+    mut stream: RecvStream,
+    downloads_dir: PathBuf,
+    pictures_dir: PathBuf,
+    timeline: Arc<Timeline>,
+    verwacht: HashSet<OpId>,
+    events: mpsc::Sender<FileEvent>,
+) {
+    match fitcom_net::filestream::read_kind(&mut stream).await {
+        Ok(fitcom_net::filestream::Inkomend::Bestand(file)) => {
+            download_taak(
+                van,
+                stream,
+                file,
+                downloads_dir,
+                pictures_dir,
+                timeline,
+                verwacht,
+                events,
+            )
+            .await;
+        }
+        // Fase 11-pad, sinds fase 13 dicht: een peer die ons een exe wil toeschuiven
+        // wordt afgewezen, ongeacht wat hij erbij beweert. Zie B-01 in
+        // `docs/SECURITY-AUDIT.md` — dit was de wormstap.
+        Ok(fitcom_net::filestream::Inkomend::Update) => {
+            tracing::warn!("update-stream van een peer geweigerd; updates komen uit de feed");
+        }
+        Err(e) => {
+            tracing::warn!(error = %format!("{e:#}"), "kind van inkomende overdracht onleesbaar");
+        }
+    }
+}
+
+/// Zoekt het bijbehorende bestand op in de (op het moment van binnenkomst al bekende)
+/// timeline, en downloadt het.
+#[allow(clippy::too_many_arguments)]
+async fn download_taak(
+    van: PeerId,
+    mut stream: RecvStream,
+    file: OpId,
+    downloads_dir: PathBuf,
+    pictures_dir: PathBuf,
+    timeline: Arc<Timeline>,
+    verwacht: HashSet<OpId>,
+    events: mpsc::Sender<FileEvent>,
+) {
+    let Some(entry) = timeline.files.iter().find(|f| f.id == file).cloned() else {
+        tracing::warn!(?file, "bestandsstream voor een onbekend bestand genegeerd");
+        return;
+    };
+
+    // B-04, twee poorten. Eerst: komt deze stream van de peer die het bestand aanbood?
+    // `entry.author` is de aanbieder, en dat is de enige van wie de bytes mogen komen.
+    if entry.author != van {
+        tracing::warn!(
+            ?file,
+            van = ?van,
+            aanbieder = ?entry.author,
+            "bestandsstream van een andere peer dan de aanbieder geweigerd"
+        );
+        return;
+    }
+    // En: hebben wij hier zelf om gevraagd? Zonder dit kan een peer ongevraagd bytes op
+    // onze schijf zetten, en dat is de stap die B-03 van één klik naar nul klikken bracht.
+    if !verwacht.contains(&file) {
+        tracing::warn!(?file, van = ?van, "ongevraagde bestandsstream geweigerd");
+        return;
+    }
+
+    if let Err(e) =
+        download_bytes(&mut stream, &downloads_dir, &pictures_dir, &entry, &events).await
+    {
+        let _ = events
+            .send(FileEvent::Mislukt {
+                file: entry.id,
+                bericht: format!("{e:#}"),
+            })
+            .await;
+    }
+}
+
+/// Het hele updatetraject in één taak: feed halen, handtekening controleren, en bij een
+/// nieuwere versie de exe ophalen en tegen de ondertekende hash leggen.
+///
+/// Alles wat blokkeert (TLS, schijf, hashen) draait in `spawn_blocking`; `release.rs`
+/// gebruikt bewust een blokkerende HTTP-client, want dit is geen heet pad en een tweede
+/// async-stack ernaast zou alleen maar dependencies kosten.
+/// Het raadsel van één dag ophalen. Losse taak op een blocking-thread, want `ureq` is
+/// synchroon en de motor mag hier niet op wachten.
+///
+/// Mislukken is geen fout: `debug` en niet `warn`, precies zoals bij een YouTube-preview.
+/// Offline is een normale toestand (invariant 7) en dit is een spelletje — er komt dan
+/// gewoon geen kaart, en over een kwartier probeert de tik het opnieuw.
+///
+/// Behalve als iemand er zelf om vroeg (`handmatig`). Dan is stil mislukken juist wél
+/// verkeerd: er staat iemand te kijken of er nu iets gebeurt. Alleen in dat geval komt de
+/// reden terug het venster in.
+async fn wordle_taak(datum: String, handmatig: bool, events: mpsc::Sender<FileEvent>) {
+    let uitkomst = tokio::task::spawn_blocking(move || wordle::haal_op(&datum)).await;
+    let reden = match uitkomst {
+        Ok(Ok(raadsel)) => {
+            let _ = events.send(FileEvent::WordleGeladen(raadsel)).await;
+            return;
+        }
+        Ok(Err(e)) => {
+            tracing::debug!(error = %format!("{e:#}"), "geen wordle van vandaag");
+            "Today's puzzle could not be fetched. Is there internet?"
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "de wordle-taak liep vast");
+            "Fetching today's puzzle went wrong."
+        }
+    };
+    if handmatig {
+        let _ = events
+            .send(FileEvent::WordleMislukt(reden.to_string()))
+            .await;
+    }
+}
+
+async fn update_check_taak(
+    updates_dir: PathBuf,
+    genegeerd: HashSet<String>,
+    handmatig: bool,
+    events: mpsc::Sender<FileEvent>,
+) {
+    let melder = events.clone();
+    let uitkomst = tokio::task::spawn_blocking(move || {
+        haal_update_op(&updates_dir, &genegeerd, handmatig, &events)
+    })
+    .await;
+    if let Err(e) = uitkomst {
+        tracing::warn!(error = %e, "update-check afgebroken");
+        // Anders blijft het slot op slot en komt er nooit meer een check.
+        let _ = melder
+            .send(FileEvent::UpdateMislukt {
+                bericht: "de update-check liep vast".into(),
+            })
+            .await;
+    }
+}
+
+/// Blokkerende helft van `update_check_taak`. Meldt elke uitkomst zelf via `events`, want
+/// de motor mag hier niet op wachten.
+fn haal_update_op(
+    updates_dir: &Path,
+    genegeerd: &HashSet<String>,
+    handmatig: bool,
+    events: &mpsc::Sender<FileEvent>,
+) {
+    let melden = |ev: FileEvent| {
+        let _ = events.blocking_send(ev);
+    };
+
+    let manifest = match release::haal_manifest() {
+        Ok(m) => m,
+        Err(e) => {
+            // Een onbereikbare feed is bij de periodieke tik geen foutmelding waard —
+            // offline is een normale toestand, en dit staat los van waar de gebruiker mee
+            // bezig is. Wie er zelf om vroeg krijgt hem wél te zien: anders is "de feed
+            // is stuk" niet te onderscheiden van "de knop doet niets".
+            tracing::debug!(error = %format!("{e:#}"), "release-feed niet gelezen");
+            melden(if handmatig {
+                FileEvent::UpdateMislukt {
+                    bericht: format!("{e:#}"),
+                }
+            } else {
+                FileEvent::GeenUpdate
+            });
+            return;
+        }
+    };
+
+    if !fitcom_proto::is_newer(&manifest.version, EIGEN_VERSIE)
+        || genegeerd.contains(&manifest.version)
+    {
+        melden(FileEvent::GeenUpdate);
+        return;
+    }
+
+    // Pas hierna wordt er iets binnengehaald: eerst moet de handtekening kloppen.
+    let hash = match release::controleer(&manifest) {
+        Ok(h) => h,
+        Err(e) => {
+            melden(FileEvent::UpdateMislukt {
+                bericht: format!("{e:#}"),
+            });
+            return;
+        }
+    };
+
+    melden(FileEvent::UpdateGestart {
+        versie: manifest.version.clone(),
+        totaal: manifest.size,
+    });
+
+    match download_met_voortgang(&manifest, hash, updates_dir, events) {
+        Ok(pad) => melden(FileEvent::UpdateKlaar { pad, hash }),
+        Err(e) => melden(FileEvent::UpdateMislukt {
+            bericht: format!("{e:#}"),
+        }),
+    }
+}
+
+fn download_met_voortgang(
+    manifest: &Release,
+    hash: [u8; 32],
+    updates_dir: &Path,
+    events: &mpsc::Sender<FileEvent>,
+) -> Result<PathBuf> {
+    release::download(manifest, hash, updates_dir, |ontvangen| {
+        let _ = events.blocking_send(FileEvent::UpdateVoortgang { ontvangen });
+    })
+}
+
+/// De laatste stap van een download: het gecontroleerde halve bestand op zijn definitieve
+/// plek zetten.
+///
+/// Twee dingen die een kale `rename` niet doet, en die allebei uit een echte melding
+/// komen (beslissing 32):
+///
+/// - **Staat het er al met de juiste grootte, dan zijn we klaar.** Bij een afbeelding is
+///   de naam de hash van de inhoud, dus hetzelfde pad bewijst dezelfde bytes — dan is er
+///   niets te vervangen. Dat scheelt niet alleen werk: op Windows *mislukt* het vervangen
+///   van een bestand dat net gelezen wordt (door het venster dat hem in de tijdlijn
+///   tekent, of een virusscanner), en dat leverde een foutmelding op voor een
+///   afbeelding die al gewoon binnen was.
+/// - **Eén keer opnieuw proberen.** Diezelfde scanner pakt een net weggeschreven bestand
+///   soms een fractie van een seconde vast. Op unix bestaat dat probleem niet; dit is de
+///   Windows-realiteit waar de mac-kant van het team nooit tegenaan liep.
+async fn zet_op_zijn_plek(deelpad: &Path, definitief: &Path, verwacht: u64) -> Result<()> {
+    if tokio::fs::metadata(definitief)
+        .await
+        .is_ok_and(|m| m.len() == verwacht)
+    {
+        let _ = tokio::fs::remove_file(deelpad).await;
+        return Ok(());
+    }
+
+    let mut poging = 0;
+    loop {
+        match tokio::fs::rename(deelpad, definitief).await {
+            Ok(()) => return Ok(()),
+            Err(e) if poging < 3 => {
+                poging += 1;
+                tracing::debug!(error = %e, poging, doel = %definitief.display(), "plek nog bezet; opnieuw");
+                tokio::time::sleep(Duration::from_millis(150 * poging)).await;
+            }
+            Err(e) => {
+                return Err(anyhow::Error::new(e).context(format!(
+                    "het bestand op zijn plek zetten ({})",
+                    definitief.display()
+                )))
+            }
+        }
+    }
+}
+
+async fn download_bytes(
+    stream: &mut RecvStream,
+    downloads_dir: &Path,
+    pictures_dir: &Path,
+    entry: &FileEntry,
+    events: &mpsc::Sender<FileEvent>,
+) -> Result<()> {
+    let deelpad = deelpad_van(entry, downloads_dir, pictures_dir);
+    let mut bestand = tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&deelpad)
+        .await
+        .context("deelbestand openen")?;
+    let mut ontvangen = bestand
+        .metadata()
+        .await
+        .context("deelbestand-grootte opvragen")?
+        .len();
+
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut laatste_update = Instant::now();
+    loop {
+        match stream.read(&mut buf).await.context("bytes ontvangen")? {
+            None => break,
+            Some(n) => {
+                // B-13: de aangekondigde grootte wordt afgedwongen in plaats van alleen
+                // getoond. Zonder dit las deze lus tot EOF zonder plafond, dus een peer
+                // die bleef sturen schreef de schijf vol — en er was geen quotum en geen
+                // vrije-ruimtecontrole. Het deelbestand gaat hier weg, want een overdracht
+                // die de eigen aankondiging overschrijdt is geen hervatbare hapering maar
+                // een peer die zich niet aan zijn woord houdt.
+                if ontvangen + n as u64 > entry.size {
+                    drop(bestand);
+                    let _ = tokio::fs::remove_file(&deelpad).await;
+                    anyhow::bail!(
+                        "peer stuurde meer dan aangekondigd ({} > {})",
+                        ontvangen + n as u64,
+                        entry.size
+                    );
+                }
+                bestand
+                    .write_all(&buf[..n])
+                    .await
+                    .context("bytes wegschrijven")?;
+                ontvangen += n as u64;
+                if laatste_update.elapsed() >= VOORTGANG_INTERVAL {
+                    laatste_update = Instant::now();
+                    let _ = events
+                        .send(FileEvent::Voortgang {
+                            file: entry.id,
+                            ontvangen,
+                        })
+                        .await;
+                }
+            }
+        }
+    }
+    bestand.flush().await.context("deelbestand doorschrijven")?;
+    drop(bestand);
+
+    // Eén sequentiële leespas over het net geschreven bestand in plaats van meehashen
+    // tijdens het schrijven: zo hoeft het hervatpunt niet bij te houden wat al eerder
+    // gehasht was, en gaan de netwerkbytes rechtstreeks naar schijf zonder een tweede
+    // kopie in het geheugen.
+    let te_hashen = deelpad.clone();
+    let verwacht = entry.hash;
+    let (_, hash) = tokio::task::spawn_blocking(move || blake3_hash_bestand(&te_hashen))
+        .await
+        .context("hash-taak afgebroken")??;
+    let klopt = hash == verwacht;
+
+    if !klopt {
+        let _ = tokio::fs::remove_file(&deelpad).await;
+        anyhow::bail!("hash klopt niet; bestand is corrupt geraakt en is verwijderd");
+    }
+
+    // Een afbeelding landt content-adresseerbaar in `pictures_dir` in plaats van in de
+    // downloadmap: dat is het pad waar de UI een miniatuur vandaan leest, en het is
+    // precies hetzelfde pad dat de aanbieder er zelf ook voor gebruikt (zie
+    // `files::hash_bestandsnaam`) — zo is een afbeelding voor beide kanten inline te
+    // tonen, niet alleen bij wie hem aanbood. Het halve bestand stond daar al (zie
+    // `deelpad_van`), dus dit is een hernoeming binnen dezelfde map.
+    let definitief = if files::is_afbeelding(&entry.name) {
+        pictures_dir.join(files::hash_bestandsnaam(&entry.hash, &entry.name))
+    } else {
+        unieke_bestandsnaam(downloads_dir, &entry.name)
+    };
+    zet_op_zijn_plek(&deelpad, &definitief, entry.size).await?;
+    let _ = events
+        .send(FileEvent::Voltooid {
+            file: entry.id,
+            pad: definitief,
+        })
+        .await;
+    Ok(())
+}
+
+#[cfg(test)]
+mod beveiliging_tests {
+    use super::*;
+
+    /// B-03: dit is de bevinding waar het doorlichtingsdocument "als er maar één ding kon"
+    /// naar wijst, dus hij verdient een test die de aanvalsvormen letterlijk opnoemt.
+    ///
+    /// Alle drie de vormen kwamen langs `Path::join`, die `..` niet normaliseert en op
+    /// Windows bij een absoluut of rooted argument de basis volledig vervangt. Een exe in de
+    /// Startup-map is code-uitvoering bij de volgende aanmelding, zonder één klik.
+    #[test]
+    fn b03_een_bestandsnaam_van_een_peer_kan_geen_pad_meer_zijn() {
+        for aanval in [
+            r"..\..\..\Startup\evil.exe",
+            r"C:\Users\alice\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup\evil.exe",
+            r"\\aanvaller\share\evil",
+            "../../../.zshrc",
+            "/etc/cron.d/evil",
+        ] {
+            let veilig = veilige_bestandsnaam(aanval);
+            assert!(
+                !veilig.contains('/') && !veilig.contains('\\') && !veilig.contains(':'),
+                "{aanval:?} leverde {veilig:?}, dat is nog een pad"
+            );
+            assert!(!veilig.is_empty(), "{aanval:?} leverde een lege naam op");
+        }
+    }
+
+    /// En het resultaat blijft onder de doelmap. Dit is de eigenschap die telt; de test
+    /// hierboven controleert de vorm, deze de uitkomst.
+    #[test]
+    fn b03_het_pad_blijft_onder_de_downloadmap() {
+        let dir = Path::new("/tmp/fitcom-test-downloads");
+        for aanval in [
+            r"..\..\..\Startup\evil.exe",
+            "../../../.zshrc",
+            r"C:\Windows\System32\evil.dll",
+        ] {
+            let pad = unieke_bestandsnaam(dir, aanval);
+            assert!(
+                pad.starts_with(dir),
+                "{aanval:?} landde op {pad:?}, buiten {dir:?}"
+            );
+        }
+    }
+
+    /// Stuurtekens horen er ook uit: een `\n` in een naam vervuilt logregels (B-33) en een
+    /// naam die alleen uit punten bestaat is op Windows geen naam.
+    #[test]
+    fn b03_stuurtekens_en_randpunten_verdwijnen() {
+        assert!(!veilige_bestandsnaam("regel\neen.txt").contains('\n'));
+        assert_eq!(veilige_bestandsnaam("..."), "bestand");
+        assert_eq!(veilige_bestandsnaam(""), "bestand");
+        // Windows kapt een punt aan het eind zelf af, dus "evil.exe ." en "evil.exe" zijn
+        // hetzelfde bestand; zonder trim valt een controle op de naam te omzeilen.
+        assert_eq!(veilige_bestandsnaam("evil.exe ."), "evil.exe");
+    }
+
+    /// `CON`, `NUL` en `COM1` zijn op Windows apparaten, ook mét extensie: naar `NUL.txt`
+    /// schrijven schrijft naar het bit-vat in plaats van naar een bestand.
+    #[test]
+    fn b03_gereserveerde_dos_namen_worden_geweigerd() {
+        for naam in ["CON", "nul.txt", "COM1.dat", "LPT9"] {
+            assert_eq!(
+                veilige_bestandsnaam(naam),
+                "bestand",
+                "{naam:?} is een apparaatnaam en hoort niet als bestandsnaam gebruikt te worden"
+            );
+        }
+    }
+
+    /// Een gewone naam mag hier niets aan overhouden — anders is de fix een regressie voor
+    /// iedereen die nooit iets kwaads stuurde.
+    #[test]
+    fn b03_een_normale_naam_blijft_ongemoeid() {
+        for naam in [
+            "vakantiefotos.zip",
+            "notulen 2026-08-13.pdf",
+            "スクリーン.png",
+        ] {
+            assert_eq!(veilige_bestandsnaam(naam), naam);
+        }
+    }
+
+    /// Een multibyte-naam boven de afkapgrens mag geen paniek geven: afkappen gebeurt op
+    /// chars, niet op bytes.
+    #[test]
+    fn b03_een_lange_multibyte_naam_paniekt_niet() {
+        let lang = "スクリーンショット".repeat(40);
+        let veilig = veilige_bestandsnaam(&lang);
+        assert_eq!(veilig.chars().count(), 120);
+    }
+}
+
+/// Rond de afbeeldingenmap: dat hij verhuist, en dat de laatste stap van een download
+/// niet meer op een bezette plek stukloopt. Zie `docs/ARCHITECTURE.md` beslissing 32.
+#[cfg(test)]
+mod afbeeldingenmap_tests {
+    use super::*;
+
+    fn tempdir(naam: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("fitcom-{naam}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn een_verhuizing_neemt_de_bestanden_en_de_onthouden_paden_mee() {
+        let basis = tempdir("verhuizing");
+        let oud = basis.join("oud");
+        let nieuw = basis.join("nieuw");
+        std::fs::create_dir_all(&oud).unwrap();
+        std::fs::create_dir_all(&nieuw).unwrap();
+        std::fs::write(oud.join("aa.png"), b"een").unwrap();
+        std::fs::write(oud.join("bb.png"), b"twee").unwrap();
+        // Dezelfde naam betekent dezelfde inhoud (het is de hash), dus deze hoeft niet mee.
+        std::fs::write(nieuw.join("bb.png"), b"twee").unwrap();
+
+        verhuis_afbeeldingen(&oud, &nieuw);
+
+        assert_eq!(std::fs::read(nieuw.join("aa.png")).unwrap(), b"een");
+        assert_eq!(std::fs::read(nieuw.join("bb.png")).unwrap(), b"twee");
+        assert!(!oud.exists(), "de oude map hoort leeg en weg te zijn");
+
+        // En het pad dat we van een aanbod onthouden hebben, wijst mee.
+        assert_eq!(
+            verhuisd_pad(&oud.join("aa.png"), &oud, &nieuw),
+            nieuw.join("aa.png")
+        );
+        // Iets buiten de afbeeldingenmap (een gewone download) blijft waar het is.
+        let elders = basis.join("downloads").join("notulen.pdf");
+        assert_eq!(verhuisd_pad(&elders, &oud, &nieuw), elders);
+    }
+
+    #[test]
+    fn verhuizen_naar_dezelfde_map_of_uit_niets_doet_niets() {
+        let basis = tempdir("verhuizing-noop");
+        std::fs::write(basis.join("aa.png"), b"een").unwrap();
+        verhuis_afbeeldingen(&basis, &basis);
+        verhuis_afbeeldingen(&basis.join("bestaat-niet"), &basis);
+        assert!(basis.join("aa.png").exists(), "niets mag zijn aangeraakt");
+    }
+
+    /// De Windows-fout die de melding opleverde: het vervangen van een bestand dat een
+    /// ander proces net leest, mislukt. Staat het er al *met de juiste grootte*, dan is er
+    /// niets te vervangen — de naam is de hash van de inhoud, dus dat zijn dezelfde bytes.
+    #[tokio::test]
+    async fn een_bestand_dat_er_al_staat_wordt_niet_vervangen() {
+        let dir = tempdir("op-zijn-plek");
+        let deelpad = dir.join("halfweg.part");
+        let definitief = dir.join("af.png");
+        std::fs::write(&deelpad, b"vier bytes").unwrap();
+        std::fs::write(&definitief, b"vier bytes").unwrap();
+
+        zet_op_zijn_plek(&deelpad, &definitief, 10).await.unwrap();
+
+        assert!(!deelpad.exists(), "het deelbestand hoort opgeruimd te zijn");
+        assert_eq!(std::fs::read(&definitief).unwrap(), b"vier bytes");
+    }
+
+    /// Staat er iets van de verkeerde grootte (een afgebroken eerdere poging), dan is het
+    /// géén bewijs van dezelfde bytes en gaat het er alsnog over.
+    #[tokio::test]
+    async fn een_half_bestand_op_de_eindplek_wordt_wel_vervangen() {
+        let dir = tempdir("op-zijn-plek-half");
+        let deelpad = dir.join("halfweg.part");
+        let definitief = dir.join("af.png");
+        std::fs::write(&deelpad, b"vier bytes").unwrap();
+        std::fs::write(&definitief, b"half").unwrap();
+
+        zet_op_zijn_plek(&deelpad, &definitief, 10).await.unwrap();
+
+        assert!(!deelpad.exists());
+        assert_eq!(std::fs::read(&definitief).unwrap(), b"vier bytes");
+    }
+
+    /// De onthouden paden moeten de verhuizing volgen, en dat moet *vóór* het wegfilteren
+    /// van paden die niet meer bestaan. Doet het dat niet, dan valt een aanbod dat we net
+    /// verhuisd hebben uit de index en kan een peer die afbeelding niet meer ophalen.
+    #[test]
+    fn de_padenindex_volgt_de_verhuisde_afbeeldingenmap() {
+        let basis = tempdir("padenindex");
+        let oud = basis.join("oud-pictures");
+        let nieuw = basis.join("nieuw-pictures");
+        std::fs::create_dir_all(&nieuw).unwrap();
+        // Het bestand staat al op zijn nieuwe plek (de verhuizing is net gebeurd), de
+        // index kent alleen nog het oude pad.
+        std::fs::write(nieuw.join("aa.png"), b"een").unwrap();
+
+        let id = OpId::new(PeerId::new_random(), Channel::GENERAL, 1);
+        let index_pad = basis.join("bestandspaden.json");
+        let index = PadenIndex {
+            aangeboden: vec![(id, oud.join("aa.png"))],
+            gedownload: vec![],
+        };
+        std::fs::write(&index_pad, serde_json::to_string(&index).unwrap()).unwrap();
+
+        let (aangeboden, _) = lees_paden_index(&index_pad, &oud, &nieuw);
+        assert_eq!(
+            aangeboden.get(&id).map(PathBuf::as_path),
+            Some(nieuw.join("aa.png").as_path()),
+            "het onthouden pad hoort mee te schuiven met de map"
+        );
+    }
+
+    /// Het halve bestand van een afbeelding hoort in de afbeeldingenmap te staan en niet
+    /// in de downloadmap: dan is de laatste stap een hernoeming binnen één map, en kan er
+    /// geen schijfgrens tussen zitten. Alles wat geen afbeelding is blijft in de
+    /// downloadmap.
+    #[test]
+    fn een_afbeelding_wordt_in_de_afbeeldingenmap_gedownload() {
+        let downloads = Path::new("/volumes/schijf-d/Downloads");
+        let pictures = Path::new("/volumes/schijf-d/Downloads/Pictures");
+        let auteur = PeerId::new_random();
+        let maak = |naam: &str| FileEntry {
+            id: OpId::new(auteur, Channel::GENERAL, 1),
+            author: auteur,
+            channel: Channel::GENERAL,
+            name: naam.to_string(),
+            size: 10,
+            hash: [0u8; 32],
+            lamport: 1,
+        };
+
+        let afbeelding = deelpad_van(&maak("plaatje.png"), downloads, pictures);
+        assert_eq!(afbeelding.parent(), Some(pictures));
+        let zip = deelpad_van(&maak("vakantie.zip"), downloads, pictures);
+        assert_eq!(zip.parent(), Some(downloads));
+    }
+}

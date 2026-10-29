@@ -1,0 +1,32 @@
+[workspace]
+resolver = "2"
+members = ["crates/proto", "crates/net", "crates/app", "crates/store", "crates/audio", "crates/video"]
+
+[workspace.package]
+version = "1.18.0"
+edition = "2021"
+rust-version = "1.97"
+license = "GPL-3.0-only"
+repository = "https://github.com/PieWhite/FitCom"
+
+[workspace.dependencies]
+fitcom-proto = { version = "=1.18.0", path = "crates/proto" }
+fitcom-net = { version = "=1.18.0", path = "crates/net" }
+fitcom-store = { version = "=1.18.0", path = "crates/store" }
+fitcom-audio = { version = "=1.18.0", path = "crates/audio" }
+fitcom-video = { version = "=1.18.0", path = "crates/video" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+# Strip debug symbols, preserve overflow checks, and unwind task-local panics.
+# Distributable builds also remap source paths; stripping alone is insufficient.
+strip = true
+overflow-checks = true
+panic = "unwind"
+
+# Media-paden hebben ook in debug builds bruikbare performance nodig,
+# anders is handmatig testen van screenshare/voice zinloos.
+[profile.dev.package."*"]
+opt-level = 2

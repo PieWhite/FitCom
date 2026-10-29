@@ -1,0 +1,47 @@
+name: Build macOS app
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Existing release tag to attach the macOS artifact to'
+        required: false
+        type: string
+permissions:
+  contents: read
+jobs:
+  build-macos:
+    runs-on: macos-14
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - name: Verify Rust toolchain
+        run: rustup update stable --no-self-update
+      - name: Build and bundle
+        run: bash scripts/bundle-mac.sh
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: FitCom-macos
+          path: target/bundle/FitCom-*-macos.zip
+          if-no-files-found: error
+      - name: Attach to existing release
+        if: startsWith(github.ref, 'refs/tags/') || inputs.release_tag != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
+        shell: bash
+        run: |
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo 'Invalid release tag'; exit 1; }
+          shopt -s nullglob
+          files=(target/bundle/FitCom-*-macos.zip)
+          [[ ${#files[@]} -eq 1 ]] || { echo 'Expected exactly one bundle'; exit 1; }
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" "${files[0]}"
+          else
+            echo 'No existing release; bundle remains a workflow artifact.'
+          fi

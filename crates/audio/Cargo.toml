@@ -1,0 +1,40 @@
+[package]
+name = "fitcom-audio"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow = "1.0.104"
+cpal = "0.18.1"
+crossbeam-channel = "0.5.16"
+fitcom-net.workspace = true
+fitcom-proto.workspace = true
+# B-35: `default-features = false` haalt de `clap 3`-subboom eruit die `atty 0.2.14`
+# (RUSTSEC-2021-0145) meesleept. Wij gebruiken alleen de library-API (`DenoiseState`); die
+# `clap` is er voor de binaries van de crate zelf, die wij nooit bouwen.
+nnnoiseless = { version = "0.5.2", default-features = false }
+opus = "0.3.1"
+tracing = "0.1.44"
+
+# Alleen voor de proces-loopback van bureaubladgeluid en Spotify;
+# zie `session::wasapi_capture`. `windows` is dezelfde versie die `wasapi` al meeneemt,
+# voor het zoeken van het Spotify-proces (`spotify::pid`) en `GetAsyncKeyState`
+# voor push-to-talk (`spreektoets`).
+[target.'cfg(windows)'.dependencies]
+wasapi = "0.25"
+windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_System_Diagnostics_ToolHelp", "Win32_UI_Input_KeyboardAndMouse"] }
+
+# Bureaubladgeluid op macOS loopt via ScreenCaptureKit (audio-only SCStream met
+# `excludesCurrentProcessAudio`, macOS 14+); zie `session::sck_capture`.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6.4"
+objc2-foundation = "0.3.2"
+objc2-core-foundation = "0.3.2"
+objc2-core-media = { version = "0.3.2", features = ["objc2-core-audio-types"] }
+objc2-core-audio-types = "0.3.2"
+objc2-screen-capture-kit = "0.3.2"
+block2 = "0.6.2"
+dispatch2 = "0.3.1"

@@ -1,0 +1,1211 @@
+//! Configuratie en identiteit.
+//!
+//! Twee bestanden, bewust gescheiden:
+//!
+//! - `config.toml` — door de gebruiker te bewerken. Adressen van de andere peers,
+//!   poorten, weergavenaam. Mag je kopiëren tussen machines.
+//! - `identity.toml` — door de app gegenereerd. Bevat de `PeerId` en het sleutelpaar van
+//!   deze installatie.
+//!   Mag je **niet** kopiëren; twee peers met dezelfde id breken de oplog-sync,
+//!   want dan botsen hun seq-nummers.
+
+use anyhow::{Context, Result};
+use fitcom_proto::PeerId;
+use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
+
+pub const DEFAULT_CONTROL_PORT: u16 = 41650;
+pub const DEFAULT_MEDIA_PORT: u16 = 41651;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Config {
+    /// Hoe de andere twee jou zien. Puur cosmetisch, mag je altijd wijzigen.
+    pub display_name: String,
+
+    #[serde(default = "default_control_port")]
+    pub control_port: u16,
+
+    #[serde(default = "default_media_port")]
+    pub media_port: u16,
+
+    /// Legacy setting retained for old configuration files. Current control/media
+    /// listeners bind to all interfaces regardless of this value. Use OS firewall
+    /// rules for network isolation; peer authentication is enforced separately.
+    #[serde(default = "default_bind_address")]
+    pub bind_address: String,
+
+    /// Fase B2: de router de control- en mediapoort laten openzetten (UPnP, PCP, NAT-PMP),
+    /// zolang de app draait, en bij netjes afsluiten weer dicht. Daarmee is deze pc van
+    /// buiten bereikbaar zonder Tailscale en zonder poorten met de hand open te zetten.
+    /// Alleen de eigen router wordt gevraagd. Uit: dan meet de app één keer wat de router
+    /// kan (A0) en zet hij niets open.
+    #[serde(default = "waar")]
+    pub port_mapping: bool,
+
+    /// Sluitknop verbergt naar de tray in plaats van af te sluiten. De app blijft dan
+    /// synchroniseren en melden terwijl je iets anders doet.
+    #[serde(default = "waar")]
+    pub minimize_to_tray: bool,
+
+    /// Meestarten met Windows. Staat standaard uit; wordt bij elke start toegepast,
+    /// dus je zet hem hier aan of uit en herstart de app.
+    #[serde(default)]
+    pub autostart: bool,
+
+    /// Naam van de microfoon zoals Windows hem toont. Leeg = standaardapparaat.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_device: Option<String>,
+
+    /// Naam van de koptelefoon of luidsprekers. Leeg = standaardapparaat.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_device: Option<String>,
+
+    /// De andere peers. Geen limiet van 3 — de code is bewust N-agnostisch.
+    #[serde(default)]
+    pub peers: Vec<PeerConfig>,
+
+    #[serde(default)]
+    pub video: VideoConfig,
+
+    #[serde(default)]
+    pub sound: SoundConfig,
+
+    /// Clips (fase 15): ringbuffer-opname van dit scherm met een hotkey om de laatste
+    /// minuut weg te schrijven. Standaard uit — het is een continue opname en dat is
+    /// een keuze die de gebruiker expliciet maakt, geen default die je overkomt.
+    #[serde(default)]
+    pub clips: ClipsConfig,
+
+    /// Push-to-talk of push-to-mute met een globale toets. Standaard spraakdetectie, zoals
+    /// het altijd was.
+    #[serde(default)]
+    pub push_to_talk: PushToTalkConfig,
+
+    /// Het spel dat schermvullend vooraan staat meesturen ("Speelt X" onder je naam bij de
+    /// anderen). Standaard aan; uit betekent dat er niets verstuurd wordt en dat de
+    /// voorgrondvenster-check niet eens draait.
+    #[serde(default = "default_share_activity")]
+    pub share_activity: bool,
+
+    /// Mogen kijkers op je gedeelde scherm tekenen (beslissing 45). Standaard aan, zoals
+    /// vóór deze instelling; uit wist alles wat er staat.
+    #[serde(default = "waar")]
+    pub allow_drawing: bool,
+
+    /// Mogen kijkers vragen je gedeelde monitor te bedienen (beslissing 54). Standaard uit. Net
+    /// als `allow_drawing` de standaard voor een nieuw scherm (de kiezer kan per scherm anders);
+    /// uitzetten zet het ook uit op elk scherm dat loopt. Op macOS doet hij niets.
+    #[serde(default)]
+    pub allow_remote_control: bool,
+
+    /// Een nieuw gedeeld scherm van een ander vanzelf bekijken, in een venster op je tweede
+    /// scherm (2026-10-23). Alleen met twee schermen en terwijl jullie samen in het gesprek
+    /// zitten; het venster pakt de focus niet. Standaard aan. Op macOS doet hij niets.
+    #[serde(default = "waar")]
+    pub auto_popout: bool,
+
+    /// Op welk scherm het vanzelf geopende venster komt, op naam uit de schermenlijst (zoals
+    /// `clips.monitor`). `None`, of een scherm dat er niet meer is: een ander scherm dan dat
+    /// van het venster vooraan.
+    #[serde(default)]
+    pub popout_monitor: Option<String>,
+
+    /// De laatste maat (clientgebied, pixels) die je een kijkvenster gaf. Elk nieuw kijkvenster
+    /// opent zo, met het beeld erin gepast en nooit groter dan het scherm.
+    #[serde(default)]
+    pub viewer_size: Option<(u32, u32)>,
+
+    /// Of het laatste kijkvenster op volledig scherm stond. Dan opent het volgende zo.
+    #[serde(default)]
+    pub viewer_fullscreen: bool,
+
+    /// Wie er in het gesprek zit, als klein venster bovenop je spel (beslissing 53).
+    /// Standaard uit.
+    #[serde(default)]
+    pub overlay: OverlayConfig,
+
+    /// Waar gedownloade bestanden landen. Leeg = `<data-map>/downloads`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub download_dir: Option<PathBuf>,
+}
+
+/// Welke tonen de app zelf maakt bij deelnemen, verlaten en delen, en hoe hard.
+///
+/// Los van de geluidsapparaten hierboven: die gaan over het *gesprek*, dit over de app.
+/// Deze tonen lopen ook niet via de voice-mixer (zie `crate::geluid`), dus ze hebben hun
+/// eigen volume nodig — de volumemixer van Windows kan de app alleen als geheel zachter
+/// zetten, en dan gaat je vriend mee.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SoundConfig {
+    /// Welke set tonen. Zie `crate::geluid::Geluidset::van_naam`; een onbekende naam valt
+    /// terug op de standaard in plaats van te weigeren, zodat een config van een nieuwere
+    /// build een oudere niet laat struikelen.
+    #[serde(default = "default_sound_set")]
+    pub set: String,
+
+    /// 0.0 tot 1.0. Nul is stil; dan wordt er niets afgespeeld in plaats van iets
+    /// onhoorbaars.
+    #[serde(default = "default_sound_volume")]
+    pub volume: f32,
+}
+
+impl Default for SoundConfig {
+    fn default() -> Self {
+        Self {
+            set: default_sound_set(),
+            volume: default_sound_volume(),
+        }
+    }
+}
+
+impl SoundConfig {
+    /// Zet met de hand geschreven waarden terug binnen wat ze kunnen betekenen.
+    ///
+    /// **TOML kent `nan` en `inf` als geldige floats.** `volume = nan` parseert dus gewoon,
+    /// en zou daarna elke sample op nul zetten: alle geluidjes stil, zonder foutmelding en
+    /// zonder dat er iets in de log staat. Dat is het soort stilte waar je een avond naar
+    /// zoekt. Een waarde buiten 0..1 valt hier ook onder — die klopt niet, maar hij hoort
+    /// afgekapt te worden en niet de app te weigeren.
+    ///
+    /// **Een onbekende `set` wordt hier bewust níet rechtgezet.** Dat is verleidelijk — met
+    /// een onbekende naam staat er in de kiezer niets geselecteerd — maar het zou de belofte
+    /// twee velden hierboven breken: een config die door een nieuwere build geschreven is
+    /// mag zijn keuze niet verliezen doordat je één keer een oudere versie start. Dezelfde
+    /// afspraak geldt voor `video.codec`. Het afspelen valt terug op de standaard (zie
+    /// `engine.rs::geluidset`) en de *weergave* laat zien wat er werkelijk klinkt
+    /// (`ui/state.rs`); de config houdt de bedoeling vast.
+    pub fn herstel(&mut self) {
+        // Alleen `nan` valt terug op de standaard: die betekent niets, dus er is niets uit
+        // op te maken. `inf` en `-inf` hebben wél een richting ("zo hard/zacht mogelijk") en
+        // die wordt gewoon afgekapt, net als 3.0 of −0.5.
+        if self.volume.is_nan() {
+            tracing::warn!("geluidvolume in de config is geen getal; standaard gebruikt");
+            self.volume = default_sound_volume();
+        }
+        self.volume = self.volume.clamp(0.0, 1.0);
+    }
+}
+
+fn default_sound_set() -> String {
+    crate::geluid::Geluidset::STANDAARD.naam().to_string()
+}
+
+/// Niet 1.0: deze tonen komen langs terwijl er gegamed wordt, en het is prettiger om ze
+/// harder te moeten zetten dan om de eerste keer te schrikken.
+fn default_sound_volume() -> f32 {
+    0.7
+}
+
+/// Instellingen voor screenshare. Staan hier zodat ze te wijzigen zijn zonder opnieuw
+/// te bouwen; de standaardwaarden horen voor iedereen te kloppen.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VideoConfig {
+    /// `h264` of `hevc`. **Laat dit op h264 staan** tenzij je zeker weet dat álle
+    /// peers HEVC kunnen decoderen; dat loopt op Windows via een Store-uitbreiding
+    /// die er niet standaard op zit. Zie `docs/ARCHITECTURE.md`.
+    #[serde(default = "default_codec")]
+    pub codec: String,
+
+    /// Bovengrens, geen belofte: er wordt elk N-de schermbeeld verstuurd met N een heel
+    /// getal, want alleen hele delers van de verversing geven gelijkmatig beeld. Op
+    /// 144 Hz levert 60 dus 48 op en 72 er 72. Zie `fitcom_video::haalbaar_tempo` en
+    /// `docs/ARCHITECTURE.md`.
+    #[serde(default = "default_fps")]
+    pub fps: u32,
+
+    /// Bits per seconde. Op het tailnet zelf zijn bits gratis, maar een peer met een
+    /// mindere eigen internetverbinding kreeg bij 25 Mbit/s meetbare audio-lag in zijn
+    /// *eigen* voice — niet bij de kijker. 12 Mbit/s loste dat op zonder merkbaar
+    /// kwaliteitsverlies. Zie `docs/ARCHITECTURE.md`, sectie "Bitrate".
+    #[serde(default = "default_bitrate")]
+    pub bitrate: u32,
+}
+
+impl Default for VideoConfig {
+    fn default() -> Self {
+        Self {
+            codec: default_codec(),
+            fps: default_fps(),
+            bitrate: default_bitrate(),
+        }
+    }
+}
+
+fn default_codec() -> String {
+    "h264".into()
+}
+
+fn default_fps() -> u32 {
+    60
+}
+
+fn default_bitrate() -> u32 {
+    12_000_000
+}
+
+/// De spraakoverlay (beslissing 53): een doorklikbaar venster bovenop alles met wie er in
+/// het gesprek zit en wie er spreekt.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct OverlayConfig {
+    /// Standaard uit: een venster bovenop een randloos spel kan dat spel uit zijn eigen
+    /// presentatiepad halen, en dat is een keuze, geen default die je overkomt.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Ook tonen zonder spel vooraan. Standaard uit: dan verschijnt hij alleen terwijl de
+    /// spelherkenning van "Stream <spel>" (`speelt`) een spel ziet.
+    #[serde(default)]
+    pub always: bool,
+    /// Linkerbovenhoek in schermpixels, gezet door hem met Alt + slepen te verplaatsen.
+    /// Leeg = linksboven op het hoofdscherm. Een plek op een monitor die er niet meer is
+    /// wordt bij het tonen naar een zichtbare geklemd.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub x: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub y: Option<i32>,
+}
+
+/// Instellingen voor de cliprecorder (fase 15). Beeldtempo, resolutie en kwaliteit zijn
+/// eigen instellingen en niet die van het delen (beslissing 57): een clip gaat niet over
+/// het internet van een vriend, dus hij hoeft niet op 12 Mbit/s te passen.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ClipsConfig {
+    /// Ringbuffer-opname aan of uit. Standaard uit: dit is een continue opname.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Hoeveel seconden een clip teruggaat. 10–7200 (twee uur); buiten die band
+    /// afgekapt door [`ClipsConfig::herstel`]. De ring op schijf houdt zoveel vast; hoeveel
+    /// dat is hangt af van de kwaliteit (`clips::mb_per_minuut`, de instelling toont het).
+    #[serde(default = "default_clips_venster")]
+    pub venster_sec: u32,
+
+    /// Welk scherm er opgenomen wordt, op naam uit de bronlijst. Leeg/leeg gelaten =
+    /// het eerste gevonden scherm; een naam die nergens meer bij hoort valt daar ook
+    /// op terug (monitors veranderen nu eenmaal), met een waarschuwing in de log.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub monitor: Option<String>,
+
+    /// De globale sneltoets voor "bewaar nu", zoals `F9`, `ctrl+alt+c`, `shift+f2`.
+    /// Ongeldig formaat valt bij het opstarten terug op F9 — zie `herstel`.
+    #[serde(default = "default_clip_hotkey")]
+    pub hotkey: String,
+
+    /// Waar clips landen. Leeg = `<data-map>/clips`. Zelfde patroon als
+    /// `download_dir`: een gebruikersbestand mag ergens staan waar de gebruiker het
+    /// terugvindt — op een andere schijf bijvoorbeeld, want een minuut 1080p60 op "high"
+    /// is ~225 MB en dat telt op.
+    ///
+    /// De ringbuffer hangt eronder (`<map>/ring`) en verhuist dus mee. Dat is geen
+    /// gebruikersdata: bij het verhuizen wordt de oude ring opgeruimd en begint de
+    /// nieuwe leeg, precies zoals bij elke start (zie OVERDRACHT beslissing 33).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub map: Option<PathBuf>,
+
+    /// Een net bewaarde clip meteen als bestandsaanbod in het algemene kanaal zetten,
+    /// maar alleen zolang je in een gesprek zit (beslissing 44). Standaard UIT.
+    ///
+    /// De sleutel heet bewust `auto_post` en niet meer `auto_delen`: 1.10.0 leverde
+    /// `auto_delen` met standaard aan, en elke config die sindsdien is opgeslagen heeft
+    /// `auto_delen = true`. Een nieuwe sleutel laat die oude waarde vanzelf negeren, dus
+    /// iedereen begint uit, zonder migratiecode. Verander de sleutel nooit terug.
+    #[serde(default, rename = "auto_post")]
+    pub auto_delen: bool,
+
+    /// Beeldtempo, een van `clips::CLIP_FPS`. Boven de verversing van het scherm levert
+    /// de opname gewoon de verversing.
+    #[serde(default = "default_clip_fps")]
+    pub fps: u32,
+
+    /// Naam uit `clips::RESOLUTIES`; `native` is de maat van het scherm.
+    #[serde(default = "default_clip_resolutie")]
+    pub resolution: String,
+
+    /// Naam uit `clips::KWALITEITEN`; de bitrate volgt daaruit en uit maat en tempo.
+    #[serde(default = "default_clip_kwaliteit")]
+    pub quality: String,
+}
+
+impl Default for ClipsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            venster_sec: default_clips_venster(),
+            monitor: None,
+            hotkey: default_clip_hotkey(),
+            map: None,
+            auto_delen: false,
+            fps: default_clip_fps(),
+            resolution: default_clip_resolutie(),
+            quality: default_clip_kwaliteit(),
+        }
+    }
+}
+
+pub(crate) fn default_clip_fps() -> u32 {
+    60
+}
+
+pub(crate) fn default_clip_resolutie() -> String {
+    "native".into()
+}
+
+pub(crate) fn default_clip_kwaliteit() -> String {
+    "high".into()
+}
+
+fn default_clips_venster() -> u32 {
+    60
+}
+
+/// De langste clip: twee uur.
+pub const MAX_CLIP_SEC: u32 = 120 * 60;
+
+/// Standaard F9: één toets, ver van de meeste gamebinds, en zonder modifier zodat hij
+/// ook tijdens het spelen met één hand te halen is.
+fn default_clip_hotkey() -> String {
+    "F9".into()
+}
+
+impl ClipsConfig {
+    pub fn herstel(&mut self) {
+        if !(10..=MAX_CLIP_SEC).contains(&self.venster_sec) {
+            tracing::warn!(
+                venster = self.venster_sec,
+                "clipvenster uit de band; standaard van 60 s gebruikt"
+            );
+            self.venster_sec = default_clips_venster();
+        }
+        if let Err(e) = crate::clips::ontled_hotkey(&self.hotkey) {
+            tracing::warn!(
+                hotkey = %self.hotkey,
+                error = %format!("{e:#}"),
+                "clip-sneltoets onleesbaar; terug op F9"
+            );
+            self.hotkey = default_clip_hotkey();
+        }
+        if !crate::clips::CLIP_FPS.contains(&self.fps) {
+            tracing::warn!(fps = self.fps, "clip-fps onbekend; terug op 60");
+            self.fps = default_clip_fps();
+        }
+        if !crate::clips::RESOLUTIES
+            .iter()
+            .any(|r| r.0 == self.resolution)
+        {
+            tracing::warn!(resolutie = %self.resolution, "clipresolutie onbekend; terug op native");
+            self.resolution = default_clip_resolutie();
+        }
+        if !crate::clips::KWALITEITEN
+            .iter()
+            .any(|k| k.0 == self.quality)
+        {
+            tracing::warn!(kwaliteit = %self.quality, "clipkwaliteit onbekend; terug op high");
+            self.quality = default_clip_kwaliteit();
+        }
+    }
+}
+
+/// Hoe de microfoon aan- en uitgaat: alleen op de stem, of met een toets erbij. De toets
+/// wordt gepold (`fitcom_audio::spreektoets`), niet geregistreerd, dus het spel dat vooraan
+/// staat krijgt hem gewoon.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PushToTalkConfig {
+    /// `voice` (alleen spraakdetectie), `talk` (toets ingedrukt = praten) of `mute` (toets
+    /// ingedrukt = stil). Een onbekende waarde valt bij het inlezen terug op `voice`.
+    #[serde(default = "default_ptt_mode")]
+    pub mode: String,
+
+    /// De toets, zoals `RightCtrl`, `CapsLock`, `F13` of `Mouse4`; zie
+    /// `fitcom_audio::spreektoets::TOETSEN` voor alle namen. Hoofdletters maken niet uit.
+    /// Een onbekende naam valt bij het inlezen terug op `RightCtrl`.
+    #[serde(default = "default_ptt_key")]
+    pub key: String,
+}
+
+impl Default for PushToTalkConfig {
+    fn default() -> Self {
+        Self {
+            mode: default_ptt_mode(),
+            key: default_ptt_key(),
+        }
+    }
+}
+
+fn default_share_activity() -> bool {
+    true
+}
+
+fn default_ptt_mode() -> String {
+    fitcom_audio::spreektoets::Modus::Spraak.naam().into()
+}
+
+fn default_ptt_key() -> String {
+    fitcom_audio::spreektoets::STANDAARD_TOETS.into()
+}
+
+impl PushToTalkConfig {
+    /// Zet met de hand geschreven waarden terug op iets dat bestaat, en schrijft de
+    /// canonieke spelling (`rightctrl` wordt `RightCtrl`). Een kapotte regel hier mag de
+    /// app niet laten weigeren te starten, en mag de microfoon ook niet stil laten vallen:
+    /// bij twijfel is het de modus van vóór deze instelling bestond.
+    pub fn herstel(&mut self) {
+        use fitcom_audio::spreektoets::{toets_van_naam, Modus};
+        match Modus::van_naam(&self.mode) {
+            Some(m) => self.mode = m.naam().into(),
+            None => {
+                tracing::warn!(modus = %self.mode, "onbekende push-to-talk-modus; spraakdetectie gebruikt");
+                self.mode = default_ptt_mode();
+            }
+        }
+        match toets_van_naam(&self.key) {
+            Some(t) => self.key = t.naam.into(),
+            None => {
+                tracing::warn!(toets = %self.key, "onbekende push-to-talk-toets; terug op RightCtrl");
+                self.key = default_ptt_key();
+            }
+        }
+    }
+
+    /// De modus en toetscode zoals de audiolaag ze wil. Alleen aanroepen na `herstel`.
+    pub fn voor_audio(&self) -> (fitcom_audio::Spreekmodus, u16) {
+        use fitcom_audio::spreektoets::{toets_van_naam, Modus};
+        (
+            Modus::van_naam(&self.mode).unwrap_or_default(),
+            toets_van_naam(&self.key).map_or(0, |t| t.vk),
+        )
+    }
+}
+
+fn waar() -> bool {
+    true
+}
+
+fn default_control_port() -> u16 {
+    DEFAULT_CONTROL_PORT
+}
+
+fn default_media_port() -> u16 {
+    DEFAULT_MEDIA_PORT
+}
+
+/// B-09: alle interfaces, zoals het altijd was. Zie het veld voor waarom dit de standaard
+/// blijft en wat je in plaats daarvan zou invullen.
+pub const ALLE_INTERFACES: &str = "0.0.0.0";
+
+fn default_bind_address() -> String {
+    ALLE_INTERFACES.to_string()
+}
+
+impl Config {
+    /// Legacy setting retained for compatibility; current listeners use all interfaces.
+    ///
+    /// De waarschuwing staat er omdat "we binden op alles" anders nergens zichtbaar is: de
+    /// app werkt prima, en dat je bereikbaar bent vanaf de wifi van het hotel merk je pas
+    /// als iemand het gebruikt. Eén regel per start, op het moment dat er toch al gelogd
+    /// wordt.
+    pub fn bind_ip(&self) -> String {
+        tracing::warn!(
+            "luistert op alle interfaces; de legacy-instelling bind_address begrenst \
+             de sockets niet. Gebruik firewallregels voor netwerkisolatie."
+        );
+        self.bind_address.clone()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeerConfig {
+    /// Tailnet-IP (`100.x.x.x`) of MagicDNS-naam. MagicDNS heeft de voorkeur: die
+    /// blijft geldig als het IP verandert. Leeg voor een peer die uit een uitnodigingscode
+    /// komt (fase B1); die wordt op `addresses` gebeld.
+    #[serde(default)]
+    pub address: String,
+
+    /// Alleen voor weergave zolang we de peer nog nooit gesproken hebben. Zodra hij
+    /// verbindt gebruiken we de naam die hij zelf opgeeft.
+    #[serde(default)]
+    pub label: String,
+
+    /// Wordt bij het eerste contact ingevuld en daarna vastgehouden (trust-on-first-use).
+    /// Verbindt er later iemand anders vanaf hetzelfde adres, dan zien we dat.
+    ///
+    /// We vragen de gebruiker niet om vooraf UUID's uit te wisselen — dat is
+    /// onnodige wrijving op een tailnet waar alleen jullie drie op zitten.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub known_id: Option<PeerId>,
+
+    #[serde(default = "default_control_port")]
+    pub control_port: u16,
+
+    /// De Ed25519-sleutel van deze peer, 32 bytes hex. Vastgepind bij het eerste contact
+    /// over het tailnet, net als `known_id`, en daarna de echte identiteitscontrole: wie
+    /// met deze `known_id` een andere sleutel toont komt er niet in (B-05, beslissing 46).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_key: Option<String>,
+
+    /// De control-adressen uit zijn uitnodigingscode (B1), om naast `address` te proberen.
+    /// Hints: binnenkomen gaat alleen met `public_key`. Een nieuwe code van dezelfde peer
+    /// vervangt ze.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub addresses: Vec<std::net::SocketAddr>,
+
+    /// Verwijderd in Settings → Network. Blijft tot de volgende start in de lijst staan,
+    /// want de plek is het targetnummer van de mesh; [`Config::save`] schrijft hem niet weg.
+    #[serde(skip)]
+    pub verwijderd: bool,
+}
+
+impl PeerConfig {
+    /// Verwijderen: ook pin, `PeerId` en adressen weg, zodat [`crate::codes::koppel`] hier
+    /// nooit meer op uitkomt en zijn code weer een nieuwe peer is.
+    pub fn vergeet(&mut self) {
+        self.verwijderd = true;
+        self.known_id = None;
+        self.public_key = None;
+        self.address.clear();
+        self.addresses.clear();
+    }
+
+    /// De vastgepinde sleutel. Een kapotte waarde telt als niet vastgepind, met een
+    /// waarschuwing: de config is van de gebruiker, en een tikfout mag de app niet laten
+    /// weigeren te starten. Leren gebeurt dan opnieuw, en alleen over het tailnet.
+    pub fn vastgepinde_sleutel(&self) -> Option<[u8; 32]> {
+        let hex = self.public_key.as_deref()?;
+        match crate::release::hex_naar_bytes::<32>(hex) {
+            Ok(k) => Some(k),
+            Err(e) => {
+                tracing::warn!(peer = %self.address, error = %format!("{e:#}"),
+                    "public_key in config.toml is onleesbaar; behandeld als niet vastgepind");
+                None
+            }
+        }
+    }
+}
+
+impl Config {
+    fn template() -> Self {
+        Self {
+            display_name: whoami_or("gebruiker"),
+            control_port: DEFAULT_CONTROL_PORT,
+            media_port: DEFAULT_MEDIA_PORT,
+            bind_address: default_bind_address(),
+            port_mapping: true,
+            minimize_to_tray: true,
+            autostart: false,
+            input_device: None,
+            output_device: None,
+            // Leeg: peers komen er sinds fase B1 bij met hun uitnodigingscode (Settings →
+            // Network), niet meer met een tailnet-adres dat je moet opzoeken.
+            peers: Vec::new(),
+            video: VideoConfig::default(),
+            sound: SoundConfig::default(),
+            clips: ClipsConfig::default(),
+            push_to_talk: PushToTalkConfig::default(),
+            share_activity: default_share_activity(),
+            allow_drawing: true,
+            allow_remote_control: false,
+            auto_popout: true,
+            popout_monitor: None,
+            viewer_size: None,
+            viewer_fullscreen: false,
+            overlay: OverlayConfig::default(),
+            download_dir: None,
+        }
+    }
+
+    pub fn load_or_create(path: &Path) -> Result<Self> {
+        if path.exists() {
+            let text = std::fs::read_to_string(path)
+                .with_context(|| format!("config lezen uit {}", path.display()))?;
+            let mut cfg: Self = toml::from_str(&text)
+                .with_context(|| format!("config parsen uit {}", path.display()))?;
+            cfg.sound.herstel();
+            cfg.clips.herstel();
+            cfg.push_to_talk.herstel();
+            Ok(cfg)
+        } else {
+            let cfg = Self::template();
+            cfg.save(path)?;
+            tracing::info!(pad = %path.display(), "voorbeeldconfig aangemaakt, pas de peer-adressen aan");
+            Ok(cfg)
+        }
+    }
+
+    pub fn save(&self, path: &Path) -> Result<()> {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let mut cfg = self.clone();
+        cfg.peers.retain(|p| !p.verwijderd);
+        let text = toml::to_string_pretty(&cfg)?;
+        std::fs::write(path, text)
+            .with_context(|| format!("config schrijven naar {}", path.display()))
+    }
+}
+
+/// De identiteit van déze installatie.
+///
+/// Geen `Debug`: de privésleutel hoort in geen enkele logregel terecht te komen.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct Identity {
+    pub peer_id: PeerId,
+    /// Ed25519-sleutelpaar als PKCS#8, hex. Bewijst bij elke verbinding dat wij deze
+    /// `peer_id` zijn (beslissing 46). Leeg in een `identity.toml` van vóór 1.11: dan
+    /// komt er een bij en blijft de `peer_id`, want daar hangt de hele chatgeschiedenis aan.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub private_key: String,
+}
+
+impl Identity {
+    pub fn load_or_create(path: &Path) -> Result<Self> {
+        let mut me = if path.exists() {
+            let text = std::fs::read_to_string(path)?;
+            toml::from_str(&text)
+                .with_context(|| format!("identiteit lezen uit {}", path.display()))?
+        } else {
+            tracing::info!("nieuwe identiteit aangemaakt");
+            Self {
+                peer_id: PeerId::new_random(),
+                private_key: String::new(),
+            }
+        };
+        if me.private_key.is_empty() {
+            let pkcs8 =
+                ring::signature::Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new())
+                    .map_err(|_| anyhow::anyhow!("sleutelpaar genereren mislukt"))?;
+            me.private_key = crate::release::bytes_naar_hex(pkcs8.as_ref());
+            tracing::info!(peer_id = %me.peer_id, "sleutelpaar aangemaakt");
+            if let Some(dir) = path.parent() {
+                std::fs::create_dir_all(dir)?;
+            }
+            crate::release::write_private_file(
+                path,
+                toml::to_string_pretty(&me)?.as_bytes(),
+                false,
+            )
+            .with_context(|| format!("identiteit schrijven naar {}", path.display()))?;
+        }
+        // Meteen controleren: een kapotte sleutel is hier een duidelijke startfout, en niet
+        // pas bij de eerste verbinding een raadselachtig "offline".
+        me.sleutelpaar()
+            .with_context(|| format!("sleutel in {} is onbruikbaar", path.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        }
+        Ok(me)
+    }
+
+    pub fn sleutelpaar(&self) -> Result<ring::signature::Ed25519KeyPair> {
+        let pkcs8 = crate::release::hex_naar_vec(&self.private_key)?;
+        ring::signature::Ed25519KeyPair::from_pkcs8(&pkcs8)
+            .map_err(|e| anyhow::anyhow!("geen geldig Ed25519-sleutelpaar: {e}"))
+    }
+}
+
+/// Waar config, database en logs staan.
+///
+/// Portable heeft voorrang: staat er een `data`-map naast de exe, dan gebruiken we die.
+/// Dat maakt "zip uitpakken en draaien" mogelijk, en meerdere instanties naast elkaar
+/// voor lokaal testen. Anders `%APPDATA%\FitCom`.
+pub fn resolve_data_dir(override_dir: Option<PathBuf>) -> Result<PathBuf> {
+    if let Some(d) = override_dir {
+        std::fs::create_dir_all(&d)?;
+        return Ok(d);
+    }
+
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(portable) = exe.parent().map(|p| p.join("data")) {
+            if portable.is_dir() {
+                return Ok(portable);
+            }
+        }
+    }
+
+    let dir = directories::ProjectDirs::from("", "", "FitCom")
+        .context("kon %APPDATA% niet bepalen")?
+        .data_dir()
+        .to_path_buf();
+    // Preserve existing installations' identity, settings, and chat history.
+    if !dir.exists() {
+        if let Some(legacy) = directories::ProjectDirs::from("", "", "FitCommunication") {
+            if legacy.data_dir().is_dir() {
+                return Ok(legacy.data_dir().to_path_buf());
+            }
+        }
+    }
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
+/// Waar gedownloade bestanden landen. `cfg.download_dir` wint als de gebruiker die
+/// gezet heeft; anders een map naast de rest van de data van deze installatie.
+pub fn resolve_download_dir(cfg: &Config, data_dir: &Path) -> PathBuf {
+    cfg.download_dir
+        .clone()
+        .unwrap_or_else(|| data_dir.join("downloads"))
+}
+
+/// Waar een afbeelding landt die je zelf aanbiedt of van een ander downloadt: een eigen
+/// map *in de downloadmap*. De bestandsnaam is de inhoudshash
+/// (`crates/app/src/files.rs::hash_bestandsnaam`) en geen leesbare naam, zodat de
+/// aanbieder en elke downloadende peer op exact hetzelfde pad uitkomen en een afbeelding
+/// voor beide kanten inline te tonen is — daarom een eigen map en niet los tussen de
+/// downloads.
+///
+/// **In de downloadmap en niet in de datamap** (dat was het tot 2026-08-20): wie zijn
+/// downloadmap naar een andere schijf verzet, kreeg geen enkele afbeelding meer binnen.
+/// Het halve bestand stond dan op de ene schijf en de eindbestemming op de andere, en
+/// `rename` kan niet over een schijfgrens heen — op Windows `os error 17`, op unix
+/// `EXDEV`. Zie `docs/ARCHITECTURE.md` beslissing 32.
+pub fn resolve_pictures_dir(cfg: &Config, data_dir: &Path) -> PathBuf {
+    pictures_in(&resolve_download_dir(cfg, data_dir))
+}
+
+/// Dezelfde regel als [`resolve_pictures_dir`], maar op een downloadmap die nog niet in
+/// de config staat — de map die de gebruiker net in de kiezer heeft aangewezen. Eén
+/// functie voor de regel, zodat de motor en het venster niet uit elkaar kunnen lopen.
+pub fn pictures_in(download_dir: &Path) -> PathBuf {
+    download_dir.join("Pictures")
+}
+
+/// Waar de titel en de miniatuur van een YouTube-link blijven staan zodra ze één keer
+/// zijn opgehaald. Zelfde niet-instelbare-plumbing-patroon als `resolve_pictures_dir`.
+/// Weggooien mag altijd: dan wordt er bij de volgende link opnieuw één keer opgehaald.
+pub fn resolve_youtube_dir(data_dir: &Path) -> PathBuf {
+    data_dir.join("youtube")
+}
+
+/// Waar een van een peer opgehaalde nieuwere exe landt (fase 11), tot hij toegepast
+/// wordt. Zelfde niet-instelbare-plumbing-patroon als `resolve_pictures_dir` — geen
+/// gebruikersbestand, dus geen `config.toml`-veld.
+pub fn resolve_updates_dir(data_dir: &Path) -> PathBuf {
+    data_dir.join("updates")
+}
+
+/// Waar clips (fase 15) landen: `clips.map` als de gebruiker die gezet heeft, anders
+/// `<data-map>/clips`. Zelfde vorm als [`resolve_download_dir`] — een clip is een
+/// gebruikersbestand dat je terugvindt en deelt, geen interne cache.
+pub fn resolve_clips_dir(cfg: &Config, data_dir: &Path) -> PathBuf {
+    cfg.clips
+        .map
+        .clone()
+        .unwrap_or_else(|| data_dir.join("clips"))
+}
+
+fn whoami_or(fallback: &str) -> String {
+    // Windows zet USERNAME, macOS/Unix zet USER; beide proberen kost niets.
+    std::env::var("USERNAME")
+        .or_else(|_| std::env::var("USER"))
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| fallback.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn config_overleeft_roundtrip() {
+        let cfg = Config::template();
+        let text = toml::to_string_pretty(&cfg).unwrap();
+        let back: Config = toml::from_str(&text).unwrap();
+        assert_eq!(back.peers.len(), cfg.peers.len());
+        assert_eq!(back.control_port, cfg.control_port);
+    }
+
+    /// De afbeeldingenmap hoort in de downloadmap te zitten, ook — juist — als de
+    /// gebruiker die naar een andere schijf verzet heeft. Anders staat het halve bestand
+    /// op de ene schijf en de eindbestemming op de andere, en dat is precies de
+    /// hernoeming die niet kan (beslissing 32).
+    #[test]
+    fn de_afbeeldingenmap_volgt_de_downloadmap() {
+        let data = Path::new("/data/fitcom");
+
+        let standaard = Config {
+            download_dir: None,
+            ..Config::template()
+        };
+        assert_eq!(
+            resolve_pictures_dir(&standaard, data),
+            resolve_download_dir(&standaard, data).join("Pictures")
+        );
+
+        let eigen = Config {
+            download_dir: Some(PathBuf::from("/volumes/schijf-d/Downloads")),
+            ..Config::template()
+        };
+        assert_eq!(
+            resolve_pictures_dir(&eigen, data),
+            Path::new("/volumes/schijf-d/Downloads/Pictures"),
+            "een eigen downloadmap moet de afbeeldingen meenemen"
+        );
+    }
+
+    #[test]
+    fn minimale_config_krijgt_defaults() {
+        // Iemand die met de hand een config schrijft mag alles weglaten behalve de naam.
+        let cfg: Config = toml::from_str(r#"display_name = "Alice""#).unwrap();
+        assert_eq!(cfg.control_port, DEFAULT_CONTROL_PORT);
+        assert_eq!(cfg.media_port, DEFAULT_MEDIA_PORT);
+        assert!(cfg.peers.is_empty());
+    }
+
+    /// De reden dat dit een eigen test heeft: een config die vóór 1.0.1 geschreven is
+    /// heeft geen `[sound]`-tabel, en die moet gewoon de standaardwaarden krijgen in
+    /// plaats van de app te laten weigeren op te starten. Dat is precies één keer eerder
+    /// misgegaan (de schema-bump van de kanalen-uitbreiding, zie docs/ARCHITECTURE.md).
+    #[test]
+    fn config_van_voor_de_geluidsinstellingen_krijgt_de_standaardset() {
+        let cfg: Config = toml::from_str(
+            r#"
+            display_name = "Alice"
+            [video]
+            codec = "h264"
+            fps = 60
+            bitrate = 12000000
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.sound, SoundConfig::default());
+    }
+
+    #[test]
+    fn een_halve_geluidstabel_vult_zichzelf_aan() {
+        let cfg: Config = toml::from_str(
+            r#"
+            display_name = "Alice"
+            [sound]
+            volume = 0.25
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.sound.volume, 0.25);
+        assert_eq!(
+            cfg.sound.set,
+            default_sound_set(),
+            "set hoort de standaard te zijn"
+        );
+    }
+
+    /// `nan` en `inf` zijn geldige TOML-floats, dus een met de hand geschreven config kan ze
+    /// bevatten — en dan zou alles stil zijn zonder dat er iets misgegaan lijkt.
+    #[test]
+    fn een_onmogelijk_volume_in_de_config_wordt_hersteld() {
+        for (tekst, verwacht) in [
+            ("nan", default_sound_volume()),
+            ("inf", 1.0),
+            ("-inf", 0.0),
+            ("-0.5", 0.0),
+            ("3.0", 1.0),
+            ("0.4", 0.4),
+        ] {
+            let mut s: SoundConfig =
+                toml::from_str(&format!("volume = {tekst}")).expect("moet parsen");
+            s.herstel();
+            assert_eq!(s.volume, verwacht, "volume = {tekst}");
+        }
+    }
+
+    /// De tegenhanger van de volume-test: een setnaam die deze build niet kent blijft staan.
+    /// Dat is voorwaartse compatibiliteit — één keer een oudere versie starten mag je keuze
+    /// niet wissen — en geen vergeten geval.
+    #[test]
+    fn een_onbekende_geluidset_blijft_in_de_config_staan() {
+        let mut s = SoundConfig {
+            set: "belletjes-uit-een-latere-build".into(),
+            volume: 0.5,
+        };
+        s.herstel();
+        assert_eq!(s.set, "belletjes-uit-een-latere-build");
+    }
+
+    /// De clipmap: leeg = naast de rest van de data, gezet = precies wat er staat. En
+    /// een config van vóór 1.6.6 heeft de sleutel niet, dus die moet gewoon starten —
+    /// zelfde reden als bij de `[sound]`-tabel hierboven.
+    #[test]
+    fn clipmap_volgt_de_instelling_en_valt_anders_terug() {
+        let data = Path::new("C:/data");
+
+        let oud: Config = toml::from_str(
+            r#"
+            display_name = "Alice"
+            [clips]
+            enabled = true
+            venster_sec = 60
+            hotkey = "F9"
+            "#,
+        )
+        .expect("een config zonder clipmap hoort te laden");
+        assert_eq!(oud.clips.map, None);
+        // Een config van vóór 1.10: automatisch delen staat uit.
+        assert!(!oud.clips.auto_delen);
+        // Een 1.10.0-config schreef `auto_delen = true` weg (toen de standaard). Die
+        // sleutel bestaat niet meer en wordt genegeerd: iedereen begint uit.
+        let uit_1_10: Config =
+            toml::from_str("display_name = \"Alice\"\n[clips]\nauto_delen = true\n").unwrap();
+        assert!(!uit_1_10.clips.auto_delen);
+        // Aanzetten blijft wél staan.
+        let aan: Config =
+            toml::from_str("display_name = \"Alice\"\n[clips]\nauto_post = true\n").unwrap();
+        assert!(aan.clips.auto_delen);
+        let terug: Config = toml::from_str(&toml::to_string_pretty(&aan).unwrap()).unwrap();
+        assert!(terug.clips.auto_delen);
+        assert_eq!(resolve_clips_dir(&oud, data), data.join("clips"));
+
+        let gezet: Config = toml::from_str(
+            r#"
+            display_name = "Alice"
+            [clips]
+            map = "D:/Clips"
+            "#,
+        )
+        .expect("een config met clipmap hoort te laden");
+        assert_eq!(resolve_clips_dir(&gezet, data), PathBuf::from("D:/Clips"));
+
+        // En hij overleeft opslaan-en-teruglezen; anders is hij één herstart later weg.
+        let terug: Config = toml::from_str(&toml::to_string_pretty(&gezet).unwrap()).unwrap();
+        assert_eq!(terug.clips.map, gezet.clips.map);
+    }
+
+    /// Een config van vóór deze instelling start met delen aan; uitzetten overleeft
+    /// opslaan-en-teruglezen.
+    #[test]
+    fn share_activity_staat_standaard_aan_ook_in_een_oude_config() {
+        let oud: Config = toml::from_str(r#"display_name = "Alice""#).unwrap();
+        assert!(oud.share_activity);
+        assert!(Config::template().share_activity);
+        let uit: Config =
+            toml::from_str("display_name = \"Alice\"\nshare_activity = false").unwrap();
+        assert!(!uit.share_activity);
+        let terug: Config = toml::from_str(&toml::to_string_pretty(&uit).unwrap()).unwrap();
+        assert!(!terug.share_activity);
+    }
+
+    /// Een config van vóór deze instelling laat tekenen toe, zoals toen; uit overleeft
+    /// opslaan-en-teruglezen.
+    #[test]
+    fn allow_drawing_staat_standaard_aan_ook_in_een_oude_config() {
+        let oud: Config = toml::from_str(r#"display_name = "Alice""#).unwrap();
+        assert!(oud.allow_drawing);
+        assert!(Config::template().allow_drawing);
+        let uit: Config =
+            toml::from_str("display_name = \"Alice\"\nallow_drawing = false").unwrap();
+        let terug: Config = toml::from_str(&toml::to_string_pretty(&uit).unwrap()).unwrap();
+        assert!(!terug.allow_drawing);
+    }
+
+    #[test]
+    fn auto_popout_staat_standaard_aan_ook_in_een_oude_config() {
+        let oud: Config = toml::from_str(r#"display_name = "Alice""#).unwrap();
+        assert!(oud.auto_popout);
+        assert!(Config::template().auto_popout);
+        let uit: Config = toml::from_str("display_name = \"Alice\"\nauto_popout = false").unwrap();
+        let terug: Config = toml::from_str(&toml::to_string_pretty(&uit).unwrap()).unwrap();
+        assert!(!terug.auto_popout);
+    }
+
+    #[test]
+    fn popout_scherm_en_venstermaat_overleven_opslaan() {
+        let mut cfg = Config::template();
+        assert_eq!(
+            (cfg.popout_monitor.as_deref(), cfg.viewer_size),
+            (None, None)
+        );
+        cfg.popout_monitor = Some("Scherm 2560×1440".into());
+        cfg.viewer_size = Some((1280, 720));
+        let terug: Config = toml::from_str(&toml::to_string_pretty(&cfg).unwrap()).unwrap();
+        assert_eq!(terug.popout_monitor, cfg.popout_monitor);
+        assert_eq!(terug.viewer_size, Some((1280, 720)));
+    }
+
+    /// Bedienen staat uit, ook in een config van vóór deze instelling; aan overleeft
+    /// opslaan-en-teruglezen.
+    #[test]
+    fn allow_remote_control_staat_standaard_uit() {
+        let oud: Config = toml::from_str(r#"display_name = "Alice""#).unwrap();
+        assert!(!oud.allow_remote_control);
+        assert!(!Config::template().allow_remote_control);
+        let aan: Config =
+            toml::from_str("display_name = \"Alice\"\nallow_remote_control = true").unwrap();
+        let terug: Config = toml::from_str(&toml::to_string_pretty(&aan).unwrap()).unwrap();
+        assert!(terug.allow_remote_control);
+    }
+
+    /// Een config van vóór de overlay start met de overlay uit; aan en een plek overleven
+    /// opslaan-en-teruglezen.
+    #[test]
+    fn overlay_staat_standaard_uit_en_onthoudt_zijn_plek() {
+        let oud: Config = toml::from_str(r#"display_name = "Alice""#).unwrap();
+        assert_eq!(oud.overlay, OverlayConfig::default());
+        assert!(!Config::template().overlay.enabled);
+        let gezet: Config = toml::from_str(
+            "display_name = \"Alice\"\n[overlay]\nenabled = true\nx = -1900\ny = 40",
+        )
+        .unwrap();
+        let terug: Config = toml::from_str(&toml::to_string_pretty(&gezet).unwrap()).unwrap();
+        assert_eq!(
+            terug.overlay,
+            OverlayConfig {
+                enabled: true,
+                always: false,
+                x: Some(-1900),
+                y: Some(40)
+            }
+        );
+    }
+
+    /// Een config van vóór de clipbeeld-instellingen start op 60 fps, native en "high";
+    /// een onbekende waarde valt terug in plaats van de app te laten weigeren.
+    #[test]
+    fn clipbeeld_start_op_de_standaard_en_valt_terug() {
+        let oud: Config = toml::from_str("display_name = \"Alice\"\n[clips]\nenabled = true")
+            .expect("een config zonder clipbeeld hoort te laden");
+        assert_eq!(
+            (
+                oud.clips.fps,
+                oud.clips.resolution.as_str(),
+                oud.clips.quality.as_str()
+            ),
+            (60, "native", "high")
+        );
+        let mut kapot: Config = toml::from_str(
+            "display_name = \"Alice\"\n[clips]\nfps = 75\nresolution = \"8k\"\nquality = \"ultra\"",
+        )
+        .unwrap();
+        kapot.clips.herstel();
+        assert_eq!(
+            (
+                kapot.clips.fps,
+                kapot.clips.resolution.as_str(),
+                kapot.clips.quality.as_str()
+            ),
+            (60, "native", "high")
+        );
+        let gezet: Config = toml::from_str(
+            "display_name = \"Alice\"\n[clips]\nfps = 144\nresolution = \"1080p\"\nquality = \"very_high\"",
+        )
+        .unwrap();
+        let mut terug: Config = toml::from_str(&toml::to_string_pretty(&gezet).unwrap()).unwrap();
+        terug.clips.herstel();
+        assert_eq!(
+            (
+                terug.clips.fps,
+                terug.clips.resolution.as_str(),
+                terug.clips.quality.as_str()
+            ),
+            (144, "1080p", "very_high")
+        );
+    }
+
+    /// Een config van vóór de push-to-talk-tabel moet starten, in de oude modus; kapotte
+    /// waarden vallen terug in plaats van de app te laten weigeren; en een gekozen toets
+    /// overleeft opslaan-en-teruglezen.
+    #[test]
+    fn push_to_talk_start_zonder_tabel_valt_terug_en_overleeft_opslaan() {
+        let oud: Config = toml::from_str(r#"display_name = "Alice""#)
+            .expect("een config zonder push-to-talk hoort te laden");
+        assert_eq!(oud.push_to_talk, PushToTalkConfig::default());
+        assert_eq!(oud.push_to_talk.mode, "voice");
+        assert_eq!(oud.push_to_talk.key, "RightCtrl");
+
+        // Alleen de modus gezet: de toets is de standaard.
+        let half: Config = toml::from_str(
+            r#"
+            display_name = "Alice"
+            [push_to_talk]
+            mode = "talk"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(half.push_to_talk.key, "RightCtrl");
+
+        let mut kapot = PushToTalkConfig {
+            mode: "schreeuwen".into(),
+            key: "Hyper".into(),
+        };
+        kapot.herstel();
+        assert_eq!(kapot, PushToTalkConfig::default());
+
+        let mut spelling = PushToTalkConfig {
+            mode: " Mute ".into(),
+            key: "mouse4".into(),
+        };
+        spelling.herstel();
+        assert_eq!(
+            (spelling.mode.as_str(), spelling.key.as_str()),
+            ("mute", "Mouse4")
+        );
+
+        let gezet = Config {
+            push_to_talk: spelling,
+            ..oud
+        };
+        let terug: Config = toml::from_str(&toml::to_string_pretty(&gezet).unwrap()).unwrap();
+        assert_eq!(terug.push_to_talk, gezet.push_to_talk);
+        let (modus, vk) = terug.push_to_talk.voor_audio();
+        assert_eq!(modus, fitcom_audio::Spreekmodus::PushToMute);
+        assert_eq!(vk, 0x05);
+    }
+
+    /// Een `identity.toml` van vóór de sleutels houdt zijn `peer_id` — daar hangt elke op
+    /// in de store aan — en krijgt er één sleutelpaar bij dat daarna vast blijft.
+    #[test]
+    fn oude_identiteit_houdt_haar_id_en_krijgt_een_vaste_sleutel() {
+        let dir = std::env::temp_dir().join(format!("fitcom-id-{}", PeerId::new_random()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pad = dir.join("identity.toml");
+        let id = PeerId::new_random();
+        std::fs::write(&pad, format!("peer_id = \"{id}\"\n")).unwrap();
+
+        let eerste = Identity::load_or_create(&pad).unwrap();
+        assert_eq!(eerste.peer_id, id);
+        assert!(!eerste.private_key.is_empty());
+
+        let tweede = Identity::load_or_create(&pad).unwrap();
+        assert_eq!(tweede.peer_id, id);
+        assert_eq!(
+            tweede.private_key, eerste.private_key,
+            "de sleutel moet vast blijven"
+        );
+        use ring::signature::KeyPair;
+        assert_eq!(
+            tweede.sleutelpaar().unwrap().public_key().as_ref(),
+            eerste.sleutelpaar().unwrap().public_key().as_ref()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn een_kapotte_sleutel_in_de_config_telt_als_niet_vastgepind() {
+        let cfg: Config = toml::from_str(&format!(
+            r#"
+            display_name = "Alice"
+            [[peers]]
+            address = "a"
+            public_key = "{}"
+            [[peers]]
+            address = "b"
+            public_key = "geen hex"
+            "#,
+            "ab".repeat(32)
+        ))
+        .unwrap();
+        assert_eq!(cfg.peers[0].vastgepinde_sleutel(), Some([0xab; 32]));
+        assert_eq!(cfg.peers[1].vastgepinde_sleutel(), None);
+    }
+
+    #[test]
+    fn peer_zonder_known_id_is_geldig() {
+        let cfg: Config = toml::from_str(
+            r#"
+            display_name = "Alice"
+            [[peers]]
+            address = "vriend-pc"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.peers[0].address, "vriend-pc");
+        assert!(cfg.peers[0].known_id.is_none());
+    }
+}

@@ -1,0 +1,98 @@
+//! Screenshare: opnemen, coderen, versturen, ontvangen, decoderen, tonen.
+//!
+//! # Twee backends, één API
+//!
+//! De platformgebonden modules (`capture`, `codec`, `d3d`, `venster`) bestaan twee
+//! keer: de Windows-bestanden hier, de macOS-tegenhangers onder `mac/`. Ze houden
+//! dezelfde modulenamen en dezelfde publieke API, gekozen met `#[cfg]` — geen traits,
+//! geen wrappers. Het ene type dat door de gedeelde code stroomt is `d3d::Beeld`
+//! (Windows: `ID3D11Texture2D`, macOS: een `CVPixelBuffer`-houder), waardoor
+//! `deler.rs`, `kijker.rs` en `fragment.rs` op beide platforms ongewijzigd compileren.
+//! `kleur` en `mf` zijn interne details van de Windows-codec en hebben geen
+//! mac-tegenhanger: VideoToolbox levert rechtstreeks BGRA en heeft geen bootstrap.
+//!
+//! # Camera
+//!
+//! `camera` bestaat alleen op Windows (Media Foundation). Een camera is naar buiten toe
+//! gewoon een derde `BronSoort`, dus hij loopt door dezelfde encoder, fragmentatie en
+//! kijker als een gedeeld scherm. Op macOS is het *opnemen* bewust niet gebouwd — zie
+//! `docs/ARCHITECTURE.md` — maar *kijken* naar de camera van een Windows-peer werkt daar wel: op de
+//! draad is dat niet van een gedeeld scherm te onderscheiden.
+
+#[cfg(windows)]
+pub mod capture;
+#[cfg(target_os = "macos")]
+#[path = "mac/capture.rs"]
+pub mod capture;
+
+#[cfg(windows)]
+pub mod codec;
+#[cfg(target_os = "macos")]
+#[path = "mac/codec.rs"]
+pub mod codec;
+
+#[cfg(windows)]
+pub mod d3d;
+#[cfg(target_os = "macos")]
+#[path = "mac/d3d.rs"]
+pub mod d3d;
+
+#[cfg(windows)]
+pub mod venster;
+#[cfg(target_os = "macos")]
+#[path = "mac/venster.rs"]
+pub mod venster;
+
+/// Muis en toetsen van een bediener bij de deler (beslissing 54). Op macOS een stub die
+/// nooit start: een mac-deler laat zich niet bedienen.
+#[cfg(windows)]
+pub mod bediening;
+#[cfg(target_os = "macos")]
+#[path = "mac/bediening.rs"]
+pub mod bediening;
+/// Tekst van en naar het klembord, alleen tussen een deler en zijn bediener. Alleen Windows.
+#[cfg(windows)]
+pub mod klembord;
+
+/// Webcam-opname. Alleen Windows; op macOS listet `capture` geen camera's en weigert
+/// `Capture::start` er een te openen.
+#[cfg(windows)]
+pub mod camera;
+pub mod deler;
+pub mod fragment;
+pub mod kijker;
+/// Het menu onder de rechterknop in het kijkvenster. Alleen Windows.
+#[cfg(windows)]
+mod kijkmenu;
+#[cfg(windows)]
+pub mod kleur;
+#[cfg(windows)]
+pub mod mf;
+/// Ringbuffer-recorder achter de clips (fase 15). Windows-only: de opnameketen zelf
+/// bestaat ook voor macOS, maar het bureaubladgeluid van een clip loopt via de
+/// WASAPI-loopback en dat heeft geen mac-tegenhanger in deze crate.
+#[cfg(windows)]
+pub mod opname;
+/// Lijnen op een BGRA-doek, voor de tekenlagen en de tegels (beslissing 45).
+pub mod penseel;
+pub mod spoor;
+/// De spraakoverlay: wie er in het gesprek zit, bovenop je spel (beslissing 53). Alleen
+/// Windows; op macOS is er geen overlay.
+#[cfg(windows)]
+pub mod spraaklaag;
+/// Het doorklikbare venster met de lijnen erop: over een kijkvenster en over een gedeelde
+/// monitor. Op macOS alleen een lege `Deellaag`.
+#[cfg(windows)]
+pub mod tekenlaag;
+#[cfg(target_os = "macos")]
+#[path = "mac/tekenlaag.rs"]
+pub mod tekenlaag;
+
+pub use capture::{beschikbare_bronnen, Bron, BronSoort};
+pub use codec::{Codec, Decoder, Encoder, EncoderConfig};
+pub use d3d::D3dContext;
+pub use deler::{deel, DelerConfig, DelerHandle};
+pub use fragment::{Frame, Reassembler};
+pub use kijker::{
+    kijk, KijkerConfig, KijkerEvent, KijkerHandle, MenuStijl, Miniatuur, Plaatsing, Scherm,
+};

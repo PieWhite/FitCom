@@ -1,0 +1,237 @@
+//! FitCom — servervrije communicatie-app voor een kleine vaste groep.
+//!
+//! Zie `README.md` voor opstarten en `docs/ARCHITECTURE.md` voor het ontwerp.
+
+// Geen consolevenster bij een release-build; in debug houden we hem wel zodat logs
+// direct zichtbaar zijn tijdens ontwikkelen.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
+use fitcom::{config, engine, tray, ui};
+
+use anyhow::{Context, Result};
+use clap::Parser;
+use config::{Config, Identity};
+use std::path::PathBuf;
+
+#[derive(Parser, Debug)]
+#[command(name = "fitcom", about = "FitCom")]
+struct Args {
+    /// Map voor config, database en logs. Zonder deze vlag: `data` naast de exe als
+    /// die bestaat, anders `%APPDATA%\FitCom`.
+    ///
+    /// Meerdere instanties op één PC starten voor een lokale test doe je hiermee:
+    /// elke instantie een eigen map, en in die config een eigen poort.
+    #[arg(long)]
+    data_dir: Option<PathBuf>,
+}
+
+fn main() {
+    // Een paniek ging in een release-build naar een stderr die er niet is, en tokio slikt
+    // die van de motor helemaal: de app werd stil offline zonder spoor in de log.
+    let standaard = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        tracing::error!(
+            thread = std::thread::current().name().unwrap_or("?"),
+            backtrace = %std::backtrace::Backtrace::force_capture(),
+            "paniek: {info}"
+        );
+        standaard(info);
+    }));
+
+    if let Err(e) = start() {
+        let tekst = format!("{e:#}");
+        tracing::error!(error = %tekst, "opstarten mislukt");
+        tray::toon_fout(&tekst);
+        std::process::exit(1);
+    }
+}
+
+fn start() -> Result<()> {
+    let args = Args::parse();
+
+    // Debug builds only: the window without mesh, store or engine, fed from JSON. Before
+    // the data directory on purpose: a fixture run must not touch a real install's logs.
+    #[cfg(debug_assertions)]
+    if let Ok(dir) = std::env::var("FITCOM_UI_FIXTURE") {
+        tracing_subscriber::fmt()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_env("FITCOM_LOG")
+                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+            )
+            .with_writer(std::io::stderr)
+            .init();
+        return ui::run_fixture(PathBuf::from(dir));
+    }
+
+    let data_dir = config::resolve_data_dir(args.data_dir)?;
+    if tray::al_actief(&data_dir) {
+        return Ok(());
+    }
+    init_logging(&data_dir)?;
+
+    tracing::info!(
+        versie = env!("CARGO_PKG_VERSION"),
+        protocol = fitcom_proto::PROTOCOL_VERSION,
+        dir = %data_dir.display(),
+        "FitCom start"
+    );
+
+    let config_path = data_dir.join("config.toml");
+    let identity_path = data_dir.join("identity.toml");
+
+    let cfg = Config::load_or_create(&config_path)?;
+    let identity = Identity::load_or_create(&identity_path)?;
+
+    tracing::info!(
+        me = %identity.peer_id,
+        naam = %cfg.display_name,
+        peers = cfg.peers.len(),
+        "configuratie geladen"
+    );
+
+    // De namen exact zoals ze in `config.toml` moeten komen te staan. Zonder dit moet
+    // je gokken hoe Windows jouw headset noemt.
+    match engine::audio_apparaten() {
+        Ok((invoer, uitvoer)) => {
+            tracing::info!(microfoons = ?invoer, weergave = ?uitvoer, "geluidsapparaten");
+        }
+        Err(e) => tracing::warn!(error = %format!("{e:#}"), "geluidsapparaten niet op te vragen"),
+    }
+
+    // De vensterlus wil de hoofdthread. Tokio krijgt daarom een eigen runtime op
+    // achtergrondthreads; de UI praat er via kanalen mee, nooit via locks.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(2)
+        .thread_name("fitcom-net")
+        .build()
+        .context("tokio-runtime opzetten")?;
+
+    // B4: waar de peers de vorige keer gezien zijn, zodat een herstart ze terugvindt zonder
+    // nieuwe code. Na de adressen uit hun code, die de dialer achteraan zet.
+    let mut gezien = fitcom::adressen::lees(&data_dir.join("adressen.json"));
+    let mesh_cfg = fitcom_net::MeshConfig {
+        me: identity.peer_id,
+        display_name: cfg.display_name.clone(),
+        control_port: cfg.control_port,
+        media_port: cfg.media_port,
+        app_version: env!("CARGO_PKG_VERSION").to_string(),
+        sleutel: std::sync::Arc::new(identity.sleutelpaar()?),
+        port_mapping: cfg.port_mapping,
+        targets: cfg
+            .peers
+            .iter()
+            .map(|p| fitcom_net::PeerTarget {
+                address: p.address.clone(),
+                label: if p.label.is_empty() {
+                    p.address.clone()
+                } else {
+                    p.label.clone()
+                },
+                known_id: p.known_id,
+                control_port: p.control_port,
+                public_key: p.vastgepinde_sleutel(),
+                kandidaten: p
+                    .known_id
+                    .and_then(|id| gezien.remove(&id))
+                    .unwrap_or_default()
+                    .into_iter()
+                    .chain(p.addresses.iter().copied())
+                    .collect(),
+            })
+            .collect(),
+    };
+
+    let mesh = {
+        let _enter = runtime.enter();
+        fitcom_net::spawn(mesh_cfg).with_context(|| {
+            format!(
+                "netwerklaag starten op poort {}; draait er al een ander programma op die poort?",
+                cfg.control_port
+            )
+        })?
+    };
+    let mesh_sluiter = mesh.sluiter();
+
+    let store = fitcom_store::Store::open(&data_dir.join("chat.sqlite"), identity.peer_id)
+        .context("chat-database openen")?;
+    tracing::info!(ops = store.op_count().unwrap_or(0), "oplog geladen");
+
+    // De motor draait op de tokio-runtime, niet op de UI-thread: chat en synchronisatie
+    // moeten doorlopen terwijl het venster geminimaliseerd is of naar de tray staat.
+    // De afbeeldingenmap staat hier niet meer: de UI leest hem uit `Snapshot::pictures_dir`,
+    // want hij verhuist mee als de gebruiker zijn downloadmap verzet (zie
+    // `config::resolve_pictures_dir` en `Ui::image_path_allowed`).
+    let youtube_dir = config::resolve_youtube_dir(&data_dir);
+
+    if let Err(e) = tray::zet_autostart(cfg.autostart) {
+        // Geen reden om de app niet te starten; alleen melden.
+        tracing::warn!(error = %format!("{e:#}"), "autostart instellen mislukt");
+    }
+
+    // De motor bezit de config vanaf hier; de UI leest er alleen vaste waarden uit
+    // (poorten, weergavenaam, autostart) en krijgt daarom een kopie.
+    let cfg_voor_ui = cfg.clone();
+
+    let engine = {
+        let _enter = runtime.enter();
+        engine::spawn(mesh, store, cfg, config_path).context("motor starten")?
+    };
+
+    // Het venster: GPUI met gpui-kit. Eigen titelbalk volgens het ontwerp; alles eromheen
+    // (tray, vensterhandle, de drie feeds) zit in `ui::run`.
+    ui::run(
+        engine,
+        identity.peer_id,
+        &cfg_voor_ui,
+        youtube_dir,
+        runtime,
+        mesh_sluiter,
+    )
+}
+
+/// Logt naar een dagelijks roterend bestand in `<data>/logs` en naar de console.
+///
+/// Bewust **niet** via `tracing_appender::non_blocking`: die buffert tot het proces
+/// netjes eindigt. Crasht de app of wordt hij hard afgesloten — precies wanneer je het
+/// logbestand nodig hebt — dan is het leeg. We loggen weinig genoeg (verbindingen, geen
+/// media-frames) dat direct schrijven niets kost.
+///
+/// Regel voor de rest van de app: nooit per frame of per audiopakket loggen.
+fn init_logging(data_dir: &std::path::Path) -> Result<()> {
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+
+    let log_dir = data_dir.join("logs");
+    std::fs::create_dir_all(&log_dir)?;
+
+    // Quinn en rustls zijn op debug-niveau extreem spraakzaam; die dempen we standaard.
+    let filter = tracing_subscriber::EnvFilter::try_from_env("FITCOM_LOG")
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,quinn=warn,rustls=warn"));
+
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(
+                    // Levert `fitcom.2026-07-29.log`. De kant-en-klare `rolling::daily`
+                    // plakt de datum áchter de extensie, wat zoeken op *.log breekt.
+                    tracing_appender::rolling::Builder::new()
+                        .rotation(tracing_appender::rolling::Rotation::DAILY)
+                        .filename_prefix("fitcom")
+                        .filename_suffix("log")
+                        // B-32: zonder dit stapelen dagbestanden zich onbeperkt op. Met
+                        // autostart aan draait dit maandenlang onbeheerd, en het volume is
+                        // vanaf het netwerk op te drijven (B-25, B-27). Twee weken is ruim
+                        // genoeg om een incident van afgelopen weekend te reconstrueren.
+                        .max_log_files(14)
+                        .build(&log_dir)
+                        .context("logbestand aanmaken")?,
+                )
+                .with_ansi(false),
+        )
+        .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
+        .init();
+
+    Ok(())
+}

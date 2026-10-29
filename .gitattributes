@@ -1,0 +1,12 @@
+# Auto detect text files and perform LF normalization
+* text=auto
+*.sh text eol=lf
+
+# Geen CRLF op de woordenlijst. `wordle.rs` bakt hem met `include_str!` in de exe en leest
+# hem als rijen van precies zes bytes (vijf letters + \n); met `core.autocrlf=true` zet git
+# er op Windows zeven van en is elk woord in de gebouwde app onzin. Dat brak v1.4.0.
+crates/app/src/wordle_woorden.txt text eol=lf
+
+# Preserve upstream font license text without reporting its original trailing spaces.
+crates/app/src/ui/assets/fonts/*-OFL.txt whitespace=-blank-at-eol
+THIRD_PARTY_LICENSES.txt whitespace=-blank-at-eol,-blank-at-eof

@@ -1,0 +1,1196 @@
+//! De kant die kijkt: ontvangen, samenstellen, decoderen, tonen.
+//!
+//! ```text
+//! UDP ─► reassembler ─► decoder ─► kleuromzetting ─► swapchain van het venster
+//! ```
+//!
+//! Eén thread per bekeken stream, met een eigen UDP-poort. Die poort staat in de
+//! `StreamSubscribe` die de motor verstuurt, en daarom hoeft dit nergens te concurreren
+//! met de voice-poort: die is bezet zodra je in een gesprek zit.
+//!
+//! # Waarom er op een keyframe gewacht wordt
+//!
+//! Een H.264-stroom is alleen te volgen vanaf een keyframe. Wie halverwege aanhaakt en
+//! toch begint te decoderen krijgt vlekken die pas bij het volgende keyframe weggaan.
+//! Beter niets tonen dan iets kapots tonen: het venster blijft leeg tot er beeld is dat
+//! klopt.
+
+use crate::codec::{Codec, Decoder};
+use crate::d3d::D3dContext;
+use crate::fragment::Reassembler;
+use crate::venster::Venster;
+use anyhow::{Context, Result};
+use crossbeam_channel::{bounded, unbounded, Receiver, Sender, TrySendError};
+use fitcom_net::{Abonnement, Verdeler};
+use fitcom_proto::bediening::Bedienstand;
+use fitcom_proto::teken::Tekening;
+use fitcom_proto::{ControlMsg, PeerId};
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+/// Kort genoeg dat het venster op muis en toetsen blijft reageren als er geen beeld
+/// binnenkomt, lang genoeg dat we niet zinloos wakker worden.
+const ONTVANG_TIMEOUT: Duration = Duration::from_millis(8);
+/// Is het volgende beeld dichterbij dan dit, dan slaapt de lus precies tot dan in plaats van
+/// op de rij van de verdeler te wachten. Een crossbeam-rij wekt in hele milliseconden (gemeten
+/// op 2026-10-19: een time-out van 1 ms duurt p90 2,5 ms), `thread::sleep` binnen een halve
+/// (p90 0,5 ms te laat). Met de socket van vóór fase B5 was dat 1,5 ms; zonder dit toonde de
+/// kijker zijn beelden op p99 0,6 ms later dan gepland.
+const PRECIES_ONDER: Duration = Duration::from_millis(2);
+/// Niet vaker dan dit om een keyframe vragen. Bij aanhoudend verlies zou een verzoek
+/// per kapot beeld de deler bedelven en het probleem alleen maar erger maken.
+const KEYFRAME_PAUZE: Duration = Duration::from_millis(500);
+/// Sneuvelt het keyframe waar we op wachten zelf, dan opnieuw vragen na zoveel in plaats
+/// van na de volle [`KEYFRAME_PAUZE`]. Een groot keyframe overleeft verlies het slechtst,
+/// en de pauze maakte van één verloren keyframe 600-700 ms stilstaand beeld (gemeten
+/// 2026-10-14). Eén keer per kapot keyframe, dus geen storm: de deler stuurt er per
+/// verzoek maar één.
+const KEYFRAME_HERVRAAG: Duration = Duration::from_millis(100);
+/// Hoe vaak er een miniatuur voor het overzicht in het hoofdvenster wordt afgeleid.
+/// Dit is geen weergavepad — twee keer per seconde is ruim genoeg om levend te ogen en
+/// te weinig om ook maar iets te merken van de GPU-naar-CPU-kopie die het kost.
+pub(crate) const MINIATUUR_INTERVAL: Duration = Duration::from_millis(500);
+/// Breedte van de miniatuur; de hoogte volgt de beeldverhouding van de bron.
+const MINIATUUR_BREEDTE: u32 = 192;
+
+#[derive(Debug, Clone)]
+pub enum KijkerEvent {
+    /// De gebruiker heeft het venster gesloten.
+    Gesloten,
+    /// We zijn de draad kwijt; de deler moet een keyframe sturen.
+    KeyframeNodig,
+    /// Een verkleind beeld voor het overzicht in het hoofdvenster. BGRA, net als de
+    /// textuur waar het uit komt — de UI zet dat zelf om naar wat egui verwacht.
+    Miniatuur(Miniatuur),
+    /// Een bericht voor de deler uit het venster: een lijn of wisverzoek (`Draw`, `DrawClear`,
+    /// beslissing 45), of bedienen (`RemoteRequest`, `RemoteInput`, `ClipboardText`, beslissing
+    /// 54). De motor beslist of het weg mag.
+    Bericht(ControlMsg),
+    /// De gebruiker zette het geluid van deze stream op dit volume (0..1), met de schuif in
+    /// het menu. Lokaal, nooit over de draad: de motor zet het op het bureaubladgeluid van
+    /// dezelfde peer, dezelfde sleutel als de schuif in het hoofdvenster.
+    Volume(f32),
+    /// De gebruiker gaf het venster deze maat (clientgebied, na een sleep), om de volgende
+    /// kijkvensters zo te openen. Niet in volledig scherm of gemaximaliseerd.
+    Maat(u32, u32),
+    /// De gebruiker zette volledig scherm aan of uit, om de volgende kijkvensters zo te openen.
+    VolledigScherm(bool),
+}
+
+/// Waar en hoe groot een kijkvenster opengaat (`Venster::open`). Op macOS genegeerd.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Plaatsing {
+    /// Vanzelf geopend: op dit scherm en zonder de focus te pakken. `None`: gewoon geopend.
+    pub vanzelf: Option<Scherm>,
+    /// De laatste maat (clientgebied, fysieke pixels) die de gebruiker een kijkvenster gaf.
+    /// Het beeld wordt daarin gepast in zijn eigen verhouding, en nooit groter dan het scherm.
+    pub maat: Option<(u32, u32)>,
+    /// De vorige keer stond een kijkvenster op volledig scherm: dan opent hij zo.
+    pub volledig: bool,
+}
+
+/// Op welk scherm een vanzelf geopend kijkvenster komt.
+#[derive(Debug, Clone, Copy)]
+pub enum Scherm {
+    /// Een ander scherm dan dat van het venster vooraan.
+    Ander,
+    /// Deze monitor (`Bron::handle` van een monitor). Is hij er niet meer, dan `Ander`.
+    Monitor(isize),
+}
+
+#[derive(Debug, Clone)]
+pub struct Miniatuur {
+    pub breedte: u32,
+    pub hoogte: u32,
+    /// BGRA, `breedte * hoogte * 4` bytes. Achter een `Arc` omdat dit elke tik opnieuw
+    /// de motor in en de snapshot in gekopieerd wordt; zonder dat zou elke publicatie
+    /// een paar honderd kilobyte per bekeken stream kopiëren in plaats van een
+    /// refcount op te hogen.
+    pub data: Arc<[u8]>,
+}
+
+#[derive(Debug, Clone)]
+pub struct KijkerConfig {
+    pub stream_id: u32,
+    pub titel: String,
+    /// Aangekondigde afmeting. Wijkt het echte beeld af, dan wint het echte beeld.
+    pub breedte: u32,
+    pub hoogte: u32,
+    pub codec: Codec,
+    /// Alleen pakketten van deze peer tellen mee: wat met zijn sleutel opengaat. Op een
+    /// open UDP-poort komt vroeg of laat iets anders binnen, en dat mag nooit in de decoder
+    /// terechtkomen.
+    pub afzender: PeerId,
+    /// De mediasocket van dit proces (`MeshHandle::post`, fase B5). De kijker bindt zelf
+    /// niets meer: hij krijgt van de verdeler wat er voor deze stream van deze peer binnenkomt.
+    pub post: Verdeler,
+    /// Hoe het menu onder de rechterknop eruitziet. `None`: geen menu (tests, voorbeelden).
+    pub menu: Option<MenuStijl>,
+    /// Waar en hoe groot het venster opengaat.
+    pub plaatsing: Plaatsing,
+}
+
+/// Kleuren, hoeken en lettertype van het menu onder de rechterknop in het kijkvenster, van de
+/// app: de tokens staan daar, de video-crate kent geen kleurwaarde. Alleen Windows tekent het.
+#[derive(Clone, Copy)]
+pub struct MenuStijl {
+    pub grond: [u8; 3],
+    /// Haarlijn om het menu en tussen de groepen, en de rand van de schuif.
+    pub rand: [u8; 3],
+    /// Achter de rij onder de muis, en achter de gekozen dikte.
+    pub hover: [u8; 3],
+    pub tekst: [u8; 3],
+    /// Tekst onder de muis, de knop van de schuif, de ring om de gekozen kleur.
+    pub sterk: [u8; 3],
+    /// Kop, sneltoetsen, wat uit staat.
+    pub gedimd: [u8; 3],
+    /// De schuif tot zijn waarde, en een schakelaar die aan staat.
+    pub accent: [u8; 3],
+    /// Hoekstraal van het menu en van een rij, in pixels bij 96 dpi.
+    pub hoek: f32,
+    pub hoek_rij: f32,
+    /// Een TrueType-bestand en zijn GDI-familienaam, zoals bij de spraakoverlay.
+    pub font: &'static [u8],
+    pub font_naam: &'static str,
+}
+
+// Met de hand: een afgeleide `Debug` zou het hele lettertype in een logregel zetten.
+impl std::fmt::Debug for MenuStijl {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("MenuStijl")
+    }
+}
+
+struct Gedeeld {
+    stop: AtomicBool,
+    beelden: AtomicU64,
+    kapot: AtomicU64,
+    /// Tijd tussen opnemen en tonen, in microseconden. Zie [`KijkerHandle::vertraging`].
+    vertraging_us: AtomicU64,
+}
+
+pub struct KijkerHandle {
+    gedeeld: Arc<Gedeeld>,
+    /// De poort waarop deze kijker beeld verwacht; hoort in `StreamSubscribe`.
+    pub poort: u16,
+    pub events: Receiver<KijkerEvent>,
+    /// Naar het venster: de tekening van de deler, na elke wijziging. Het venster pakt
+    /// alleen de laatste, op zijn eigen tempo, dus nooit een slot op het videopad.
+    tekening: Sender<Arc<Tekening>>,
+    /// Naar het venster: waar we staan met bedienen (beslissing 54), en klembordtekst van de
+    /// deler. Zelfde tempo als de tekening, nooit per pakket.
+    naar_venster: Sender<NaarVenster>,
+    /// Wat er laatst aan volume naar het venster ging, om alleen een wijziging te sturen.
+    volume: Option<Option<f32>>,
+}
+
+/// Wat de motor het venster laat weten over bedienen, en het geluid bij dit beeld.
+pub(crate) enum NaarVenster {
+    Bediening(Bedienstand),
+    Klembord(String),
+    Volume(Option<f32>),
+}
+
+impl KijkerHandle {
+    /// De tekening op deze stream is veranderd (of het mag-tekenen van de deler).
+    pub fn zet_tekening(&self, t: Arc<Tekening>) {
+        let _ = self.tekening.send(t);
+    }
+
+    /// Waar we staan met het bedienen van deze stream.
+    pub fn zet_bediening(&self, stand: Bedienstand) {
+        let _ = self.naar_venster.send(NaarVenster::Bediening(stand));
+    }
+
+    /// Klembordtekst van de deler, terwijl we hem bedienen.
+    pub fn zet_klembord(&self, tekst: String) {
+        let _ = self.naar_venster.send(NaarVenster::Klembord(tekst));
+    }
+
+    /// Het volume van het geluid bij dit beeld, of `None` als er nu geen is (de deler deelt
+    /// geen bureaubladgeluid, of we horen het niet). Mag elke publicatie; gaat alleen bij een
+    /// wijziging naar het venster.
+    pub fn zet_volume(&mut self, volume: Option<f32>) {
+        if self.volume != Some(volume) {
+            self.volume = Some(volume);
+            let _ = self.naar_venster.send(NaarVenster::Volume(volume));
+        }
+    }
+
+    /// Aantal getoonde beelden en het aantal dat onderweg sneuvelde. Voor `StreamStats`
+    /// en om in de UI te kunnen zien of de verbinding het aankan.
+    pub fn tellers(&self) -> (u64, u64) {
+        (
+            self.gedeeld.beelden.load(Ordering::Relaxed),
+            self.gedeeld.kapot.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Tijd tussen het opnemen van een beeld en het tonen ervan: opnemen, coderen,
+    /// versturen, samenstellen, decoderen, presenteren.
+    ///
+    /// **Alleen geldig als deler en kijker in hetzelfde proces draaien.** De tijdstempel
+    /// op de draad hangt aan de klok van de deler, en tussen twee machines loopt die
+    /// niet gelijk. Dit is dus een meetinstrument voor de ketentest, geen waarde om in
+    /// de UI te zetten.
+    pub fn vertraging(&self) -> Duration {
+        Duration::from_micros(self.gedeeld.vertraging_us.load(Ordering::Relaxed))
+    }
+}
+
+impl Drop for KijkerHandle {
+    fn drop(&mut self) {
+        self.gedeeld.stop.store(true, Ordering::Relaxed);
+        tracing::info!("kijken gestopt");
+    }
+}
+
+/// Opent een venster en begint te luisteren. De poort in de handle moet naar de deler,
+/// anders komt er nooit beeld.
+pub fn kijk(d3d: &D3dContext, cfg: KijkerConfig) -> Result<KijkerHandle> {
+    let pakketten = cfg.post.luister_beeld(cfg.afzender, cfg.stream_id);
+    let poort = cfg.post.poort();
+
+    let gedeeld = Arc::new(Gedeeld {
+        stop: AtomicBool::new(false),
+        beelden: AtomicU64::new(0),
+        kapot: AtomicU64::new(0),
+        vertraging_us: AtomicU64::new(0),
+    });
+
+    // Het venster en de decoder moeten leven op de thread die ze bedient, dus we
+    // wachten hier af of dat gelukt is. Zo krijgt de gebruiker een nette melding in
+    // plaats van een venster dat er nooit komt.
+    let (klaar_tx, klaar_rx) = bounded::<Result<()>>(1);
+    let (event_tx, events) = bounded(16);
+    let (tekening, tekening_rx) = unbounded();
+    let (naar_venster, naar_venster_rx) = unbounded();
+
+    let d3d = d3d.clone();
+    let staat = gedeeld.clone();
+    let stream_id = cfg.stream_id;
+    std::thread::Builder::new()
+        .name(format!("fitcom-kijk-{stream_id}"))
+        .spawn(move || match opzetten(&d3d, &cfg) {
+            Ok((venster, decoder)) => {
+                let _ = klaar_tx.send(Ok(()));
+                kijk_lus(
+                    venster,
+                    decoder,
+                    &d3d,
+                    pakketten,
+                    &cfg,
+                    &staat,
+                    &event_tx,
+                    &tekening_rx,
+                    &naar_venster_rx,
+                );
+                let _ = event_tx.send(KijkerEvent::Gesloten);
+            }
+            Err(e) => {
+                let _ = klaar_tx.send(Err(e));
+            }
+        })
+        .context("kijk-thread starten")?;
+
+    klaar_rx
+        .recv_timeout(Duration::from_secs(10))
+        .context("videovenster reageert niet")??;
+
+    tracing::info!(stream = stream_id, poort, "kijken gestart");
+
+    Ok(KijkerHandle {
+        gedeeld,
+        poort,
+        events,
+        tekening,
+        naar_venster,
+        volume: None,
+    })
+}
+
+fn opzetten(d3d: &D3dContext, cfg: &KijkerConfig) -> Result<(Venster, Decoder)> {
+    let decoder = Decoder::new(d3d, cfg.codec, cfg.breedte, cfg.hoogte)?;
+    let mut venster = Venster::open(d3d, &cfg.titel, cfg.breedte, cfg.hoogte, cfg.plaatsing)?;
+    if let Some(stijl) = cfg.menu {
+        venster.zet_menu_stijl(stijl);
+    }
+    Ok((venster, decoder))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn kijk_lus(
+    mut venster: Venster,
+    mut decoder: Decoder,
+    d3d: &D3dContext,
+    pakketten: Abonnement,
+    cfg: &KijkerConfig,
+    gedeeld: &Arc<Gedeeld>,
+    events: &Sender<KijkerEvent>,
+    tekening: &Receiver<Arc<Tekening>>,
+    naar_venster: &Receiver<NaarVenster>,
+) {
+    // Teken- en bedienwerk voor de deler dat nog niet in `events` paste. Een stuk lijn
+    // overslaan zou de rest van die lijn bij iedereen laten verdwijnen (een gat), en een
+    // overgeslagen loslaten laat een toets hangen, dus het wacht.
+    let mut tekenwerk: VecDeque<ControlMsg> = VecDeque::new();
+    // Een volume uit het menu dat nog niet in `events` paste.
+    let mut volume: Option<f32> = None;
+    let mut laatste_tekening = Instant::now();
+    let mut samensteller = Reassembler::new();
+    // De codec waar de huidige decoder voor gebouwd is; begint als de gok uit de
+    // config en volgt daarna wat de pakketten zelf melden.
+    let mut codec_actief = cfg.codec;
+
+    // Aanhaken kan alleen op een keyframe. Bij de start is dat er nog niet, dus we
+    // vragen er meteen om: als de deler al voor iemand anders bezig was, staat het
+    // volgende keyframe anders misschien seconden verderop.
+    let mut wacht_op_keyframe = true;
+    let mut laatst_gevraagd = Instant::now() - KEYFRAME_PAUZE;
+    let mut laatste_incompleet = 0u64;
+    let mut laatste_kapotte_keyframes = 0u64;
+    let mut laatste_pomp = Instant::now();
+    let mut laatste_miniatuur = Instant::now() - MINIATUUR_INTERVAL;
+
+    // Eigen ijkpunten voor de meter: `laatste_incompleet` hierboven stuurt het
+    // keyframe-herstel aan en wordt alleen bijgewerkt als een beeld compleet werd. De
+    // meter moet elke verandering zien, ook die van beelden die nooit afkwamen.
+    let mut meter = Meter::nieuw(cfg.stream_id);
+    let (mut gemeten_incompleet, mut gemeten_verworpen, mut gemeten_hersteld) = (0u64, 0u64, 0u64);
+    let mut gemeten_hersync = 0u64;
+
+    let mut klok = Weergaveklok::nieuw();
+    let mut uitvouwer = Uitvouwer::default();
+    let mut wachtrij: std::collections::VecDeque<(Instant, Instant, crate::fragment::Frame)> =
+        std::collections::VecDeque::new();
+
+    let begin = Instant::now();
+    let mut spoor = crate::spoor::Spoor::nieuw(
+        &format!("kijker-{}", cfg.stream_id),
+        "getoond_ms,ts90k,aankomst_ms,gepland_ms,keyframe,bytes,decode_us,toon_us,mini_us,wachtrij,incompleet",
+    );
+    let mut verlies = crate::spoor::Spoor::nieuw(
+        &format!("verlies-{}", cfg.stream_id),
+        "ms,verwacht_seq,gekregen_seq,gemist,ts90k,keyframe,frag_index,stil_us",
+    );
+    let mut vorige_seq: Option<u32> = None;
+    let mut vorig_pakket = Instant::now();
+
+    while !gedeeld.stop.load(Ordering::Relaxed) {
+        meter.tik();
+
+        // Alles waarvan de tijd gekomen is decoderen; alleen het laatste tonen. Meer dan
+        // één tegelijk betekent dat we achterlopen, en dan is de nieuwste de juiste.
+        while wachtrij
+            .front()
+            .is_some_and(|(op, _, _)| *op <= Instant::now())
+        {
+            let (gepland, aankomst, frame) = wachtrij.pop_front().expect("net gezien");
+            let laatste_die_toe_was = !wachtrij
+                .front()
+                .is_some_and(|(op, _, _)| *op <= Instant::now());
+            let sporen = Sporen {
+                begin,
+                gepland,
+                aankomst,
+                wachtrij: wachtrij.len(),
+                incompleet: samensteller.incompleet,
+            };
+            if !toon_beeld(
+                &mut decoder,
+                &mut venster,
+                d3d,
+                gedeeld,
+                events,
+                &mut meter,
+                &mut laatste_miniatuur,
+                &frame,
+                laatste_die_toe_was,
+                &mut spoor,
+                &sporen,
+            ) {
+                decoder.spoel();
+                wacht_op_keyframe = true;
+                laatst_gevraagd = Instant::now() - KEYFRAME_PAUZE;
+            }
+        }
+
+        // Het venster bedienen mag niet bij elk pakket: bij 1080p60 zijn dat er
+        // duizenden per seconde en dan doen we niets anders meer.
+        if laatste_pomp.elapsed() >= Duration::from_millis(8) {
+            laatste_pomp = Instant::now();
+            // Tekenen loopt mee op dit tempo en niet per pakket: een nieuwe tekening alleen
+            // als de motor er een stuurde, en dan alleen de laatste.
+            if laatste_tekening.elapsed() >= crate::penseel::MIN_HERTEKEN {
+                if let Some(t) = tekening.try_iter().last() {
+                    venster.zet_tekening(t);
+                    laatste_tekening = Instant::now();
+                }
+            }
+            for bericht in naar_venster.try_iter() {
+                match bericht {
+                    NaarVenster::Bediening(stand) => venster.zet_bediening(stand),
+                    NaarVenster::Klembord(tekst) => venster.zet_klembord(tekst),
+                    NaarVenster::Volume(v) => venster.zet_volume(v),
+                }
+            }
+            if !venster.pomp() {
+                break;
+            }
+            tekenwerk.extend(venster.werk(cfg.stream_id));
+            // Alleen de laatste stand van de schuif telt; past hij nu niet, dan de volgende pomp.
+            volume = venster.volume_keuze().or(volume);
+            // Eens per sleep; valt hij weg omdat het kanaal vol zit, dan geldt de vorige maat.
+            if let Some((b, h)) = venster.maat_keuze() {
+                let _ = events.try_send(KijkerEvent::Maat(b, h));
+            }
+            if let Some(v) = venster.volledig_keuze() {
+                let _ = events.try_send(KijkerEvent::VolledigScherm(v));
+            }
+            if let Some(v) = volume {
+                if events.try_send(KijkerEvent::Volume(v)).is_ok() {
+                    volume = None;
+                }
+            }
+            while let Some(msg) = tekenwerk.pop_front() {
+                if let Err(TrySendError::Full(KijkerEvent::Bericht(msg))) =
+                    events.try_send(KijkerEvent::Bericht(msg))
+                {
+                    tekenwerk.push_front(msg);
+                    break;
+                }
+            }
+        }
+
+        if wacht_op_keyframe && laatst_gevraagd.elapsed() >= KEYFRAME_PAUZE {
+            laatst_gevraagd = Instant::now();
+            meter.keyframe_verzoeken += 1;
+            let _ = events.try_send(KijkerEvent::KeyframeNodig);
+        }
+
+        // Wacht er beeld op zijn beurt, dan moet de lus op tijd wakker zijn; anders komt elk
+        // beeld te laat en is de hele planning voor niets geweest.
+        let tot_beeld = wachtrij
+            .front()
+            .map(|(op, _, _)| op.saturating_duration_since(Instant::now()));
+        let pakket = match tot_beeld {
+            Some(rest) if rest <= PRECIES_ONDER => match pakketten.try_recv() {
+                Ok(p) => p,
+                Err(crossbeam_channel::TryRecvError::Empty) => {
+                    std::thread::sleep(rest.min(Duration::from_millis(1)));
+                    continue;
+                }
+                Err(crossbeam_channel::TryRecvError::Disconnected) => break,
+            },
+            rest => {
+                match pakketten.recv_timeout(rest.map_or(ONTVANG_TIMEOUT, |r| {
+                    (r - PRECIES_ONDER).min(ONTVANG_TIMEOUT)
+                })) {
+                    Ok(p) => p,
+                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
+                    // Een nieuwere kijker op dezelfde stream kreeg de route; deze krijgt niets meer.
+                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+                }
+            }
+        };
+        let (van, header, payload) = (pakket.van, pakket.header, &pakket.payload[..]);
+        // `van` is bewezen: het pakket ging open met de sleutel van die peer. Dat is de
+        // hele controle tegen ingeschoven fragmenten (B-28); de bronpoort-heuristiek van
+        // vóór protocol 6 is weg. De `stream_id` zit in het versleutelde deel.
+        if header.stream_id != cfg.stream_id || van != cfg.afzender {
+            continue;
+        }
+
+        // De draad bepaalt de codec, niet onze eigen config: de deler encodeert met
+        // zíjn instelling en de header zegt wat er echt in de pakketten zit. Zonder
+        // deze wissel voedde een kijker met `h264` in zijn config een H.264-decoder
+        // met HEVC-bytes (of andersom) en bleef het venster geluidloos wit.
+        match Codec::van_payload(header.payload_type) {
+            Some(codec) if codec != codec_actief => {
+                tracing::info!(
+                    verwacht = codec_actief.naam(),
+                    echt = codec.naam(),
+                    "deler stuurt een andere codec; decoder omgewisseld"
+                );
+                match Decoder::new(d3d, codec, cfg.breedte, cfg.hoogte) {
+                    Ok(d) => {
+                        decoder = d;
+                        codec_actief = codec;
+                        wacht_op_keyframe = true;
+                        laatst_gevraagd = Instant::now() - KEYFRAME_PAUZE;
+                    }
+                    Err(e) => {
+                        // Structureel, niet tijdelijk: deze machine kán deze codec
+                        // niet aan (HEVC zonder Store-extensie, HEVC op macOS). Het
+                        // venster sluiten is eerlijker dan eeuwig wit blijven.
+                        tracing::error!(
+                            codec = codec.naam(),
+                            error = %format!("{e:#}"),
+                            "geen decoder voor de codec die de deler stuurt"
+                        );
+                        break;
+                    }
+                }
+            }
+            Some(_) => {}
+            None => {
+                // Onbekend payload-type: loggen en negeren, zoals het protocol
+                // voorschrijft — een nieuwere peer stuurt misschien een codec die
+                // wij nog niet kennen.
+                tracing::debug!(
+                    payload_type = header.payload_type.0,
+                    "onbekend payload-type genegeerd"
+                );
+                continue;
+            }
+        }
+
+        meter.fragmenten += 1;
+        meter.bytes += (fitcom_proto::MEDIA_HEADER_LEN + payload.len()) as u64;
+
+        // Gaten in `seq` zijn het enige harde bewijs van verlies: de deler telt hem per
+        // fragment door, dus een sprong betekent dat er iets tussenuit is.
+        if let Some(v) = vorige_seq {
+            let verwacht = v.wrapping_add(1);
+            if header.seq != verwacht {
+                crate::spoor::spoor!(
+                    verlies,
+                    "{:.3},{verwacht},{},{},{},{},{},{}",
+                    Instant::now().duration_since(begin).as_secs_f64() * 1000.0,
+                    header.seq,
+                    header.seq.wrapping_sub(verwacht),
+                    header.timestamp,
+                    u8::from(header.is_keyframe()),
+                    header.frag_index,
+                    vorig_pakket.elapsed().as_micros() as u64
+                );
+            }
+        }
+        vorige_seq = Some(header.seq);
+        vorig_pakket = Instant::now();
+
+        let klaar = samensteller.push(&header, payload);
+
+        meter.incompleet += samensteller.incompleet - gemeten_incompleet;
+        meter.verworpen += samensteller.verworpen - gemeten_verworpen;
+        meter.hersteld += samensteller.hersteld - gemeten_hersteld;
+        meter.hersync += samensteller.hersynchronisaties - gemeten_hersync;
+        gemeten_incompleet = samensteller.incompleet;
+        gemeten_verworpen = samensteller.verworpen;
+        gemeten_hersteld = samensteller.hersteld;
+        gemeten_hersync = samensteller.hersynchronisaties;
+
+        let Some(frame) = klaar else {
+            continue;
+        };
+
+        // Kapotte beelden tellen op; loopt dat op, dan missen we stukken en heeft
+        // doorgaan geen zin tot er een nieuw keyframe is.
+        if samensteller.incompleet > laatste_incompleet {
+            gedeeld
+                .kapot
+                .store(samensteller.incompleet, Ordering::Relaxed);
+            laatste_incompleet = samensteller.incompleet;
+            if !wacht_op_keyframe {
+                wacht_op_keyframe = true;
+                decoder.spoel();
+                laatst_gevraagd = Instant::now() - KEYFRAME_PAUZE;
+            } else if samensteller.incompleet_keyframes > laatste_kapotte_keyframes {
+                // Het keyframe waar we op wachtten komt niet meer: zo zetten dat het
+                // volgende verzoek [`KEYFRAME_HERVRAAG`] na het vorige vertrekt.
+                laatst_gevraagd =
+                    laatst_gevraagd.min(Instant::now() - (KEYFRAME_PAUZE - KEYFRAME_HERVRAAG));
+            }
+            laatste_kapotte_keyframes = samensteller.incompleet_keyframes;
+        }
+
+        if frame.keyframe {
+            tracing::debug!(stream = cfg.stream_id, "keyframe ontvangen");
+        }
+
+        if wacht_op_keyframe {
+            if !frame.keyframe {
+                continue;
+            }
+            wacht_op_keyframe = false;
+        }
+
+        // Niet meteen tonen: inplannen op de tijd waarop dit beeld is opgenomen. Dat is
+        // het verschil tussen "zo snel mogelijk" en "op tijd", en alleen het tweede ziet
+        // eruit als vloeiend.
+        let aankomst = Instant::now();
+        let toon_op = klok.plan(uitvouwer.uitvouwen(frame.timestamp), aankomst);
+        wachtrij.push_back((toon_op, aankomst, frame));
+
+        if wachtrij.len() > MAX_WACHTEND {
+            // De klok is ergens weggesprongen — deler herstart, stream opnieuw begonnen.
+            // Opnieuw ijken en wat er ligt tonen; achterlopen heeft geen zin.
+            tracing::info!(stream = cfg.stream_id, "weergaveklok opnieuw geijkt");
+            klok.opnieuw_ijken();
+            let nu = Instant::now();
+            for (op, _, _) in wachtrij.iter_mut() {
+                *op = nu;
+            }
+        }
+    }
+
+    if let Some(s) = spoor.as_mut() {
+        s.klaar();
+    }
+    if let Some(s) = verlies.as_mut() {
+        s.klaar();
+    }
+}
+
+/// Alleen voor het diagnostische spoor: wat er over dit beeld te vertellen valt buiten
+/// het beeld zelf.
+struct Sporen {
+    begin: Instant,
+    gepland: Instant,
+    aankomst: Instant,
+    wachtrij: usize,
+    incompleet: u64,
+}
+
+/// Decodeert één beeld en toont het, tenzij er nog een verser exemplaar achteraan staat.
+/// Levert `false` op als de decoder struikelde; dan is een nieuw keyframe het herstel.
+#[allow(clippy::too_many_arguments)]
+fn toon_beeld(
+    decoder: &mut Decoder,
+    venster: &mut Venster,
+    d3d: &D3dContext,
+    gedeeld: &Arc<Gedeeld>,
+    events: &Sender<KijkerEvent>,
+    meter: &mut Meter,
+    laatste_miniatuur: &mut Instant,
+    frame: &crate::fragment::Frame,
+    tonen: bool,
+    spoor: &mut Option<crate::spoor::Spoor>,
+    sporen: &Sporen,
+) -> bool {
+    let tijd_hns = naar_hns(frame.timestamp);
+    let voor_decode = Instant::now();
+    let uit_decoder = decoder.decode(&frame.data, tijd_hns);
+    let decode_us = voor_decode.elapsed().as_micros() as u64;
+    meter.decode_us += decode_us;
+    let mut mini_us = 0u64;
+
+    match uit_decoder {
+        Ok(Some(beeld)) => {
+            // Elk beeld gaat wél door de decoder — die heeft ze nodig als referentie voor
+            // de volgende — maar alleen het laatste dat aan de beurt was gaat het scherm
+            // op. De rest zou je toch niet zien.
+            if !tonen {
+                return true;
+            }
+            let voor_toon = Instant::now();
+            if let Err(e) = venster.toon(&beeld) {
+                tracing::error!(error = %format!("{e:#}"), "beeld tonen mislukt");
+                return true;
+            }
+            let toon_us = voor_toon.elapsed().as_micros() as u64;
+            meter.toon_us += toon_us;
+            meter.toonde(voor_toon, tijd_hns);
+            gedeeld.beelden.fetch_add(1, Ordering::Relaxed);
+            meet_vertraging(gedeeld, tijd_hns);
+
+            if laatste_miniatuur.elapsed() >= MINIATUUR_INTERVAL {
+                *laatste_miniatuur = Instant::now();
+                let voor_mini = Instant::now();
+                match maak_miniatuur(d3d, &beeld) {
+                    Ok(m) => {
+                        let _ = events.try_send(KijkerEvent::Miniatuur(m));
+                    }
+                    Err(e) => {
+                        tracing::debug!(error = %format!("{e:#}"), "miniatuur maken mislukt");
+                    }
+                }
+                mini_us = voor_mini.elapsed().as_micros() as u64;
+            }
+            crate::spoor::spoor!(
+                spoor,
+                "{:.3},{},{:.3},{:.3},{},{},{decode_us},{toon_us},{mini_us},{},{}",
+                voor_toon.duration_since(sporen.begin).as_secs_f64() * 1000.0,
+                frame.timestamp,
+                sporen.aankomst.duration_since(sporen.begin).as_secs_f64() * 1000.0,
+                sporen.gepland.duration_since(sporen.begin).as_secs_f64() * 1000.0,
+                u8::from(frame.keyframe),
+                frame.data.len(),
+                sporen.wachtrij,
+                sporen.incompleet
+            );
+            true
+        }
+        Ok(None) => true,
+        Err(e) => {
+            // Een beschadigd beeld laat de decoder struikelen. Opnieuw beginnen bij het
+            // volgende keyframe is hier het herstel, niet stoppen.
+            tracing::warn!(error = %format!("{e:#}"), "beeld decoderen mislukt");
+            false
+        }
+    }
+}
+
+/// Hoeveel voorsprong we nemen op de weergave.
+///
+/// Dit is de prijs voor gelijkmatig beeld: een beeld dat eerder klaar is dan zijn beurt
+/// wacht even. Te klein en elk beeld dat een paar milliseconden later binnenkomt is al te
+/// laat, en dan zijn we terug bij tonen-zodra-het-kan. Te groot en je kijkt naar het
+/// verleden. Op een tailnet met 9 ms heen en weer is dit ruim; bij zichtbare vertraging is
+/// dit de knop.
+const WEERGAVE_VOORSPRONG: Duration = Duration::from_millis(30);
+
+/// Een beeld dat zoveel later op het scherm kwam dan de opname-afstand tot het vorige
+/// voorschreef, telt als te laat. Het verschil telt en niet het gat zelf: een 24
+/// fps-film heeft van nature gaten van 42 ms (en 50 ms met 3:2-pulldown), en de oude
+/// drempel van 40 ms op het kale gat gaf daarop duizenden loze waarschuwingen per sessie,
+/// elk een logschrijfactie op de weergavethread (2026-10-14).
+const TE_LAAT_MS: f64 = 25.0;
+
+/// Zoveel beelden mogen er hoogstens wachten. Meer betekent dat de klok ergens is
+/// weggesprongen — een herstart van de deler, een stream die opnieuw begint — en dan is
+/// opnieuw ijken beter dan een halve seconde achterlopen.
+const MAX_WACHTEND: usize = 16;
+
+/// Wanneer een binnengekomen beeld getoond moet worden.
+///
+/// # Waarom dit er moet zijn
+///
+/// De tijdstempel op de draad zegt wanneer het beeld is *opgenomen*. Zonder deze klok
+/// toont de kijker elk beeld zodra het compleet is, en dan bepaalt de reis — netwerk,
+/// planning van threads, hoe vol de ontvangbuffer net zat — wanneer het op het scherm
+/// komt. Beelden die gelijkmatig zijn opgenomen komen dan ongelijkmatig in beeld, en dat
+/// is precies wat je ziet als haperen, ook als er geen enkel beeld verloren gaat en de
+/// teller keurig zestig per seconde meldt.
+///
+/// Audio heeft dit al (`fitcom-audio::jitter`), video niet. Dat verschil is de reden dat
+/// het geluid vloeiend was terwijl het beeld schokte.
+///
+/// # Hoe de twee klokken aan elkaar geknoopt worden
+///
+/// De deler en de kijker delen geen klok en gaan die ook niet synchroniseren — dat zou
+/// een tijdserver vragen die we niet hebben en niet willen. Wat wel kan: het beeld dat er
+/// het *snelst* over deed, deed er de minste reistijd over, en dat beeld bepaalt dus de
+/// beste schatting van hoe de twee klokken zich verhouden. Vandaar het minimum van
+/// `aankomst − verstreken` over een venster, en niet het gemiddelde: dat zou meelopen met
+/// elke vertraging.
+///
+/// Het venster loopt door in twee emmers, zodat een eenmalige uitschieter er vanzelf weer
+/// uit valt en een klok die langzaam wegloopt gevolgd wordt.
+struct Weergaveklok {
+    eerste_ts: Option<u64>,
+    huidig_min: Option<Instant>,
+    vorig_min: Option<Instant>,
+    emmer_begin: Instant,
+}
+
+/// Na zoveel tijd schuift de lopende emmer door. Twee emmers samen zijn dus het venster
+/// waarover het minimum genomen wordt.
+const EMMER: Duration = Duration::from_secs(2);
+
+impl Weergaveklok {
+    fn nieuw() -> Self {
+        Self {
+            eerste_ts: None,
+            huidig_min: None,
+            vorig_min: None,
+            emmer_begin: Instant::now(),
+        }
+    }
+
+    fn opnieuw_ijken(&mut self) {
+        *self = Self::nieuw();
+    }
+
+    /// `ts` is de uitgevouwen tijdstempel van de draad in 90 kHz-tikken.
+    fn plan(&mut self, ts: u64, aangekomen: Instant) -> Instant {
+        let eerste = *self.eerste_ts.get_or_insert(ts);
+        let verstreken = Duration::from_nanos(ts.saturating_sub(eerste) * 1_000_000_000 / 90_000);
+
+        // Waar het nulpunt van de deler ligt op onze klok, als dit beeld er niets over
+        // gedaan had.
+        let kandidaat = aangekomen - verstreken;
+
+        if self.emmer_begin.elapsed() >= EMMER {
+            self.emmer_begin = Instant::now();
+            self.vorig_min = self.huidig_min.take();
+        }
+        self.huidig_min = Some(match self.huidig_min {
+            Some(m) => m.min(kandidaat),
+            None => kandidaat,
+        });
+
+        let basis = match (self.huidig_min, self.vorig_min) {
+            (Some(a), Some(b)) => a.min(b),
+            (Some(a), None) | (None, Some(a)) => a,
+            (None, None) => kandidaat,
+        };
+
+        basis + verstreken + WEERGAVE_VOORSPRONG
+    }
+}
+
+/// Vouwt de 32-bits tijdstempel van de draad uit naar een doorlopende teller.
+///
+/// Op 90 kHz loopt hij elke dertien uur om. Dat is zeldzaam en juist daarom gevaarlijk:
+/// zonder dit springt de planning er een halve dag naast en staat het beeld stil.
+#[derive(Default)]
+struct Uitvouwer {
+    hoog: u64,
+    vorige: Option<u32>,
+}
+
+impl Uitvouwer {
+    fn uitvouwen(&mut self, ts: u32) -> u64 {
+        if let Some(v) = self.vorige {
+            // Een sprong terug over meer dan de helft van het bereik is een omloop, geen
+            // beeld dat te laat is.
+            if v > ts && v - ts > u32::MAX / 2 {
+                self.hoog += 1;
+            }
+        }
+        self.vorige = Some(ts);
+        (self.hoog << 32) | u64::from(ts)
+    }
+}
+
+/// De tegenhanger van de meter bij de deler: één regel per seconde, op `info`.
+///
+/// Dit is de kant die de deler niet kan zien. `incompleet` boven nul betekent dat er
+/// fragmenten onderweg sneuvelen; `keyframe_verzoeken` telt hoe vaak we de deler daarom
+/// om een nieuw keyframe vragen. Lopen die twee samen op, dan zit je in de lus waarbij
+/// elk keyframe een burst is die zelf weer verlies veroorzaakt.
+struct Meter {
+    stream_id: u32,
+    sinds: Instant,
+    fragmenten: u32,
+    bytes: u64,
+    getoond: u32,
+    incompleet: u64,
+    verworpen: u64,
+    /// Verloren fragmenten die uit de pariteit teruggerekend zijn. Elk daarvan zou
+    /// zonder pariteit een bevroren beeld van rond de honderd milliseconde geweest zijn,
+    /// dus dit is het getal dat zegt of dat werkt. Zie `crate::fragment`.
+    hersteld: u64,
+    /// Hoe vaak de samensteller opnieuw moest beginnen omdat de tijdstempel wegsprong.
+    /// Eén keer is een deler die herstartte; oplopend betekent dat er iemand pakketten met
+    /// rare tijdstempels bijschuift. Zonder deze regel is dat onzichtbaar (B-11).
+    hersync: u64,
+    keyframe_verzoeken: u32,
+    decode_us: u64,
+    toon_us: u64,
+    /// Afstanden tussen twee getoonde beelden, als som en som-van-kwadraten in
+    /// milliseconden. Daar komt de standaardafwijking uit, en **dat is het getal dat
+    /// zegt of het hapert**: het aantal beelden per seconde kan kloppen terwijl ze
+    /// ongelijk uit elkaar staan, en dan ziet het er alsnog uit als schokken.
+    vorige_toon: Option<Instant>,
+    /// Opnametijd van het vorige getoonde beeld, in hns.
+    vorige_opname: Option<i64>,
+    /// Beelden die meer dan [`TE_LAAT_MS`] later kwamen dan de opname voorschreef, en de
+    /// ergste daarvan. Dát is haperen; een laag `getoond_fps` met nul te laat is gewoon
+    /// trage inhoud bij de deler.
+    te_laat: u32,
+    ergste_ms: f64,
+    afstand_som: f64,
+    afstand_som_kwadraat: f64,
+    afstanden: u32,
+}
+
+impl Meter {
+    fn nieuw(stream_id: u32) -> Self {
+        Self {
+            stream_id,
+            sinds: Instant::now(),
+            fragmenten: 0,
+            bytes: 0,
+            getoond: 0,
+            incompleet: 0,
+            verworpen: 0,
+            hersteld: 0,
+            hersync: 0,
+            keyframe_verzoeken: 0,
+            decode_us: 0,
+            toon_us: 0,
+            vorige_toon: None,
+            vorige_opname: None,
+            te_laat: 0,
+            ergste_ms: 0.0,
+            afstand_som: 0.0,
+            afstand_som_kwadraat: 0.0,
+            afstanden: 0,
+        }
+    }
+
+    /// Eén beeld op het scherm gezet.
+    fn toonde(&mut self, nu: Instant, opname_hns: i64) {
+        if let Some(vorige) = self.vorige_toon {
+            let ms = nu.duration_since(vorige).as_secs_f64() * 1000.0;
+            self.afstand_som += ms;
+            self.afstand_som_kwadraat += ms * ms;
+            self.afstanden += 1;
+            // Een negatief of absurd opnamegat (omloop, deler herstart) zegt niets.
+            if let Some(vorige_opname) = self.vorige_opname {
+                let opname_ms = (opname_hns - vorige_opname) as f64 / 10_000.0;
+                if (0.0..1000.0).contains(&opname_ms) {
+                    let laat = ms - opname_ms;
+                    if laat > TE_LAAT_MS {
+                        self.te_laat += 1;
+                        self.ergste_ms = self.ergste_ms.max(laat);
+                    }
+                }
+            }
+        }
+        self.vorige_toon = Some(nu);
+        self.vorige_opname = Some(opname_hns);
+        self.getoond += 1;
+    }
+
+    fn spreiding_ms(&self) -> f64 {
+        if self.afstanden < 2 {
+            return 0.0;
+        }
+        let n = f64::from(self.afstanden);
+        let gem = self.afstand_som / n;
+        (self.afstand_som_kwadraat / n - gem * gem).max(0.0).sqrt()
+    }
+
+    fn tik(&mut self) {
+        let dt = self.sinds.elapsed();
+        if dt < Duration::from_secs(1) {
+            return;
+        }
+        let s = dt.as_secs_f64();
+        let per_beeld = |us: u64| {
+            if self.getoond == 0 {
+                0.0
+            } else {
+                (us as f64 / self.getoond as f64 / 100.0).round() / 10.0
+            }
+        };
+        tracing::info!(
+            stream = self.stream_id,
+            getoond_fps = (self.getoond as f64 / s).round() as u32,
+            spreiding_ms = (self.spreiding_ms() * 100.0).round() / 100.0,
+            mbit = ((self.bytes as f64 * 8.0 / s / 1e5).round() / 10.0),
+            frag_per_s = (self.fragmenten as f64 / s).round() as u32,
+            incompleet = self.incompleet,
+            verworpen = self.verworpen,
+            hersteld = self.hersteld,
+            hersync = self.hersync,
+            keyframe_verzoeken = self.keyframe_verzoeken,
+            te_laat = self.te_laat,
+            ergste_te_laat_ms = self.ergste_ms.round() as u32,
+            decode_ms = per_beeld(self.decode_us),
+            toon_ms = per_beeld(self.toon_us),
+            "kijker"
+        );
+        let (vorige_toon, vorige_opname) = (self.vorige_toon, self.vorige_opname);
+        *self = Meter::nieuw(self.stream_id);
+        // De afstand over de secondegrens heen telt gewoon door; anders mis je juist de
+        // hapering die precies daar valt.
+        self.vorige_toon = vorige_toon;
+        self.vorige_opname = vorige_opname;
+    }
+}
+
+/// Hoe lang dit beeld erover deed van opnemen tot tonen.
+///
+/// Alleen zinnig als de deler dezelfde klok gebruikt als wij — dus in hetzelfde proces.
+/// Tussen twee machines levert dit onzin op, en daarom staat het nergens in de UI.
+fn meet_vertraging(gedeeld: &Arc<Gedeeld>, opgenomen_hns: i64) {
+    let nu_hns = (crate::deler::klok_nulpunt().elapsed().as_nanos() / 100) as i64;
+    let verschil = nu_hns - opgenomen_hns;
+    if verschil <= 0 || verschil > 10 * crate::codec::HNS_PER_SEC {
+        return; // klokken van verschillende machines; niets te meten
+    }
+    // Voortschrijdend gemiddelde: één beeld dat toevallig achterliep zegt niets, het
+    // gaat om waar de keten gemiddeld op uitkomt.
+    let nieuw = (verschil / 10) as u64;
+    let oud = gedeeld.vertraging_us.load(Ordering::Relaxed);
+    let gemiddeld = if oud == 0 {
+        nieuw
+    } else {
+        (oud * 7 + nieuw) / 8
+    };
+    gedeeld.vertraging_us.store(gemiddeld, Ordering::Relaxed);
+}
+
+/// Van de 90 kHz-klok op de draad terug naar de eenheden van Media Foundation.
+fn naar_hns(tijdstempel: u32) -> i64 {
+    (u64::from(tijdstempel) * crate::codec::HNS_PER_SEC as u64 / 90_000) as i64
+}
+
+/// Verkleint het getoonde beeld tot een miniatuur voor het overzicht in het
+/// hoofdvenster. Loopt via `D3dContext::lees_bgra_miniatuur`, dat alleen de nodige
+/// pixels uit de uitleestextuur bemonstert in plaats van het hele beeld te kopiëren.
+///
+/// Ook de deler gebruikt dit, voor de terugblik op je eigen camera: dezelfde tegel in
+/// dezelfde strook, dus dezelfde maat en hetzelfde tempo.
+pub(crate) fn maak_miniatuur(d3d: &D3dContext, beeld: &crate::d3d::Beeld) -> Result<Miniatuur> {
+    let (bron_b, bron_h) = crate::d3d::afmetingen(beeld);
+    let hoogte = ((MINIATUUR_BREEDTE as u64 * bron_h as u64) / bron_b.max(1) as u64).max(1) as u32;
+    let data = d3d.lees_bgra_miniatuur(beeld, MINIATUUR_BREEDTE, hoogte)?;
+    Ok(Miniatuur {
+        breedte: MINIATUUR_BREEDTE,
+        hoogte,
+        data: data.into(),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Een reis die elke keer anders lang duurt: netwerk, planning van threads, een
+    /// ontvangbuffer die net vol zat. Vaste reeks, zodat de test elke keer hetzelfde doet.
+    const REISTIJD_MS: [u64; 10] = [4, 11, 5, 19, 4, 7, 26, 4, 9, 13];
+
+    #[test]
+    fn gelijkmatig_opgenomen_beeld_wordt_gelijkmatig_getoond() {
+        // Dit is waar het allemaal om draait. De deler neemt keurig op 60 beelden per
+        // seconde op; onderweg wordt die regelmaat verpest. Toont de kijker zodra een
+        // beeld compleet is, dan staan ze op het scherm zoals ze aankwamen — met
+        // uitschieters van 20 ms, en dát is wat je ziet als haperen. Plant hij op de
+        // tijdstempel, dan komt de regelmaat van de opname terug.
+        let mut klok = Weergaveklok::nieuw();
+        let begin = Instant::now();
+        let stap_ticks = 90_000 / 60;
+
+        let gepland: Vec<Instant> = (0..300u64)
+            .map(|n| {
+                let ts = n * stap_ticks;
+                let ideaal = begin + Duration::from_nanos(n * 1_000_000_000 / 60);
+                let aangekomen =
+                    ideaal + Duration::from_millis(REISTIJD_MS[n as usize % REISTIJD_MS.len()]);
+                klok.plan(ts, aangekomen)
+            })
+            .collect();
+
+        let afstanden: Vec<f64> = gepland
+            .windows(2)
+            .map(|w| w[1].duration_since(w[0]).as_secs_f64() * 1000.0)
+            .collect();
+        let gem = afstanden.iter().sum::<f64>() / afstanden.len() as f64;
+        let spreiding = (afstanden.iter().map(|a| (a - gem).powi(2)).sum::<f64>()
+            / afstanden.len() as f64)
+            .sqrt();
+
+        assert!(
+            spreiding < 0.01,
+            "{spreiding:.3} ms ongelijk terwijl de opname gelijkmatig was; de reistijd \
+             lekt door naar het scherm"
+        );
+        assert!(
+            (16.6..=16.7).contains(&gem),
+            "gemiddeld {gem:.2} ms tussen twee beelden; verwacht 16,67"
+        );
+    }
+
+    #[test]
+    fn een_beeld_dat_te_laat_is_wordt_niet_vooruit_gepland() {
+        // Eén beeld doet er veel langer over dan de rest. Dat mag de klok niet meeslepen:
+        // het minimum over het venster blijft staan, dus de rest houdt zijn plek.
+        let mut klok = Weergaveklok::nieuw();
+        let begin = Instant::now();
+        let stap = Duration::from_nanos(1_000_000_000 / 60);
+
+        let eerste = klok.plan(0, begin);
+        let tweede = klok.plan(1500, begin + stap + Duration::from_millis(200));
+        let derde = klok.plan(3000, begin + stap * 2);
+
+        assert_eq!(
+            derde.duration_since(eerste).as_millis(),
+            33,
+            "het derde beeld hoort twee stappen na het eerste te staan"
+        );
+        assert!(
+            tweede < derde,
+            "de volgorde moet kloppen, ook als er eentje laat is"
+        );
+    }
+
+    #[test]
+    fn de_tijdstempel_mag_omlopen() {
+        // Op 90 kHz gebeurt dat elke dertien uur. Zonder uitvouwen springt de planning
+        // er een halve dag naast en staat het beeld stil.
+        let mut u = Uitvouwer::default();
+        assert_eq!(u.uitvouwen(u32::MAX - 1), u64::from(u32::MAX - 1));
+        assert_eq!(u.uitvouwen(u32::MAX), u64::from(u32::MAX));
+        assert_eq!(u.uitvouwen(3), (1u64 << 32) + 3, "dit is een omloop");
+        assert_eq!(u.uitvouwen(9), (1u64 << 32) + 9);
+    }
+
+    #[test]
+    fn b30_een_omlopende_tijdstempel_komt_door_de_hele_keten() {
+        // De test hierboven dekt `Uitvouwer` los, en dat is precies waarom B-30 zo lang
+        // onopgemerkt bleef: hij bleef groen terwijl de samensteller de sprong terug die
+        // een omloop *ís* juist weggooide, dus `hoog` kon nooit oplopen en na 13 uur 15
+        // minuten onafgebroken kijken stond het beeld stil. Deze test duwt daarom een
+        // omlopende reeks door `Reassembler` én `Uitvouwer` heen — de keten uit
+        // `kijk_lus`, in die volgorde.
+        use crate::fragment::{headers_voor, Reassembler};
+        use fitcom_proto::PayloadType;
+
+        let stap = 90_000 / 60; // 60 beelden per seconde in 90 kHz-tikken
+        let bron = vec![7u8; 2_000]; // twee fragmenten plus pariteit
+        let mut samensteller = Reassembler::new();
+        let mut uitvouwer = Uitvouwer::default();
+        let mut klok = Weergaveklok::nieuw();
+        let begin = Instant::now();
+
+        // Drie beelden vóór de omloop, vijf erna.
+        let eerste_ts = u32::MAX - 3 * stap;
+        let mut uitgevouwen = Vec::new();
+        let mut gepland = Vec::new();
+        for n in 0..8u32 {
+            let ts = eerste_ts.wrapping_add(n * stap);
+            let mut compleet = None;
+            for (h, s) in headers_voor(1, ts, PayloadType::H264, n == 0, n * 3, &bron) {
+                if let Some(f) = samensteller.push(&h, &s) {
+                    compleet = Some(f);
+                }
+            }
+            let frame = compleet.unwrap_or_else(|| {
+                panic!("beeld {n} (ts {ts}) kwam niet door de samensteller — B-30 is terug")
+            });
+            let ts64 = uitvouwer.uitvouwen(frame.timestamp);
+            uitgevouwen.push(ts64);
+            gepland.push(klok.plan(ts64, begin + Duration::from_micros(u64::from(n) * 16_667)));
+        }
+
+        for paar in uitgevouwen.windows(2) {
+            assert_eq!(
+                paar[1] - paar[0],
+                u64::from(stap),
+                "de uitgevouwen tijdstempel moet gelijkmatig doorlopen, ook over de omloop"
+            );
+        }
+        assert!(
+            uitgevouwen[7] > u64::from(u32::MAX),
+            "na de omloop hoort de teller boven het 32-bits bereik te liggen"
+        );
+        for paar in gepland.windows(2) {
+            assert!(
+                paar[1] > paar[0],
+                "de weergaveklok moet blijven doorlopen; anders staat het beeld stil"
+            );
+        }
+    }
+
+    #[test]
+    fn tijdstempel_overleeft_de_heen_en_terugweg() {
+        // De deler rekent naar 90 kHz, de kijker terug. Loopt dat uit de pas, dan
+        // krijgt de decoder tijden die niet oplopen en gaat hij beelden weggooien.
+        for beeld in 0..600i64 {
+            let hns = beeld * (crate::codec::HNS_PER_SEC / 60);
+            let heen = crate::deler::naar_klok(hns);
+            let terug = naar_hns(heen);
+            assert!(
+                (terug - hns).abs() <= crate::codec::HNS_PER_SEC / 90_000,
+                "beeld {beeld}: {hns} werd {terug}"
+            );
+        }
+    }
+}

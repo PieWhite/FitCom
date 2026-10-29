@@ -1,0 +1,43 @@
+[package]
+name = "fitcom-net"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow = "1.0.104"
+# De mediasleuteltabel: de mesh-actor schrijft hem, de mediathreads lezen hem zonder lock
+# (beslissing 46). Stond al in de lockfile.
+arc-swap = "1.9.2"
+# B5: de ene mediathread geeft pakketten door aan audio en kijkers, zoals die crates al doen.
+crossbeam-channel = "0.5.16"
+fitcom-proto.workspace = true
+# A0: één keer meten wat de router doet (UPnP, PCP, NAT-PMP) en welk adres hij naar buiten
+# toont. Een port van de portmapper van Tailscale, met ondersteuning voor NAT-PMP en PCP
+# (beslissing 6 van docs/ARCHITECTURE.md). Zonder metrics.
+portmapper = { version = "0.19.3", default-features = false }
+quinn = { version = "0.11.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
+# ring i.p.v. aws-lc-rs: die laatste vereist cmake + nasm om te bouwen op Windows.
+# Moet overeenkomen met quinn's "rustls-ring" feature, anders krijg je twee
+# crypto-providers en een panic op "no process-level CryptoProvider available".
+rcgen = { version = "0.14.7", default-features = false, features = ["crypto", "pem", "ring"] }
+# Ed25519 voor de identiteit in de handshake (beslissing 46). Zat er al in via rustls en
+# rcgen; dit maakt hem alleen direct bruikbaar.
+ring = "0.17.14"
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+# Alleen voor SO_RCVBUF op de mediasocket; std kan dat niet. Zat hier al in via quinn.
+socket2 = "0.6.5"
+thiserror = "2.0.19"
+tokio = { version = "1.53.3", features = ["rt-multi-thread", "net", "sync", "time", "macros", "io-util"] }
+tracing = "0.1.44"
+
+# `Win32_Media` voor timeBeginPeriod: zonder dat duurt elke leestimeout op de mediasocket
+# 15,6 ms in plaats van wat er gevraagd wordt. Zie `media::zorg_voor_fijne_timer`.
+# `Win32_Foundation` voor SetHandleInformation; zie `media::niet_doorgeven_aan_kindproces`.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_Media"] }
+
+[dev-dependencies]
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
