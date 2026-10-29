@@ -18,7 +18,7 @@ This is not a certification, a penetration test, or a two-machine media test.
 - cargo-deny: all checks passed for Windows and Apple Silicon macOS with
   `-W unmaintained`; maintenance and duplicate-version warnings remain visible.
   No advisory IDs were ignored. Declared dependency licenses and allowed sources passed.
-- Gitleaks: explicit source snapshot and fresh one-commit history scanned; no
+- Gitleaks: explicit source snapshot and fresh history from a single clean root scanned; no
   detected credentials. Pattern scanning does not prove the absence of all secrets
   or personal information. Local instructions, keys, runtime data, editor state,
   designs, historical working notes, and old Git objects were excluded.

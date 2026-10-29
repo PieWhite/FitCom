@@ -12,13 +12,16 @@ permissions:
   contents: read
 jobs:
   build-macos:
-    runs-on: macos-14
+    runs-on: macos-15
+    env:
+      MACOSX_DEPLOYMENT_TARGET: '14.0'
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           persist-credentials: false
+          ref: ${{ inputs.release_tag || github.ref }}
       - name: Verify Rust toolchain
         run: rustup update stable --no-self-update
       - name: Build and bundle
