@@ -17,7 +17,7 @@ are required. See [security policy](SECURITY.md) and [audit](docs/SECURITY-AUDIT
 
 - Persistent chat, channels, direct messages, reactions, and reconnect synchronization.
 - Opus voice, noise suppression, push-to-talk, and per-peer volume.
-- Screen sharing, desktop audio, music, and optional remote control with local approval.
+- Screen sharing, desktop audio, music, and optional Windows remote control with local approval.
 - Windows camera broadcasting; macOS can view Windows camera streams.
 - File transfers, local clips/recordings, Windows tray and optional autostart.
 - Signed Windows updates; YouTube previews and daily Wordle integration.

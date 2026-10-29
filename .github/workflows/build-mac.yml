@@ -44,7 +44,11 @@ jobs:
           files=(target/bundle/FitCom-*-macos.zip)
           [[ ${#files[@]} -eq 1 ]] || { echo 'Expected exactly one bundle'; exit 1; }
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
-            gh release upload "$RELEASE_TAG" "${files[0]}"
+            if gh release view "$RELEASE_TAG" --json assets --jq '.assets[].name' | grep -Fxq "$(basename "${files[0]}")"; then
+              echo 'Bundle already published; preserving the existing release asset.'
+            else
+              gh release upload "$RELEASE_TAG" "${files[0]}"
+            fi
           else
             echo 'No existing release; bundle remains a workflow artifact.'
           fi

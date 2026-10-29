@@ -216,6 +216,12 @@ impl Venster {
         None
     }
 
+    /// AppKit owns native fullscreen; saving its state is not implemented on macOS.
+    /// Keep the shared viewer interface without emitting a synthetic preference.
+    pub fn volledig_keuze(&mut self) -> Option<bool> {
+        None
+    }
+
     /// Zet één beeld in de weergavewachtrij. Thread-veilig vanaf de kijk-thread.
     pub fn toon(&mut self, beeld: &Beeld) -> Result<()> {
         let maat = afmetingen(beeld);
