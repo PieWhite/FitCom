@@ -26,5 +26,8 @@ commitment is guaranteed.
   coordinated manual replacement. A GitHub token alone cannot sign releases.
 
 See [current audit](docs/SECURITY-AUDIT.md) for patches and remaining findings.
+The public-operation author-spoofing issue remains **open**; its
+[remediation task](docs/SECURITY-REMEDIATION.md) specifies the required signing,
+trust, migration and regression-test work. A documented plan is not a patch.
 Code review and dependency scans are not a formal penetration test or a guarantee
 that the application has no vulnerabilities.

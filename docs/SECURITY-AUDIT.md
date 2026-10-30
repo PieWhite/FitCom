@@ -24,6 +24,11 @@ the target author, so they do not repair this gap.
 An invited peer is trusted with public-channel content. This is not an appropriate
 security model for adversarial communities or mutually untrusted users.
 
+Follow-up, 2026-10-30: this finding is still **open in 1.18.1 / protocol 6**.
+The [remediation task](SECURITY-REMEDIATION.md) records implementation entry points,
+key-binding requirements, unsigned-history migration hazards and acceptance tests,
+including a Claude handoff prompt. No operation-signature repair has shipped.
+
 ## Protections verified in the current source
 
 - **Peer identity:** Ed25519 proofs bind the identity to a role-specific TLS exporter.
