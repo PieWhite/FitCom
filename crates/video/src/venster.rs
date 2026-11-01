@@ -1321,7 +1321,11 @@ fn schakel_volledig_scherm(hwnd: HWND, staat: &mut Staat) {
             staat.volledig_scherm = false;
             staat.volledig_uit = Some(false);
             let plaatsing = staat.vorige_plaatsing;
-            let _ = SetWindowLongPtrW(hwnd, GWL_STYLE, WS_OVERLAPPEDWINDOW.0 as isize);
+            let _ = SetWindowLongPtrW(
+                hwnd,
+                GWL_STYLE,
+                (WS_OVERLAPPEDWINDOW | WS_VISIBLE).0 as isize,
+            );
             let _ = SetWindowPlacement(hwnd, &plaatsing);
             let _ = SetWindowPos(
                 hwnd,
@@ -1347,7 +1351,9 @@ fn schakel_volledig_scherm(hwnd: HWND, staat: &mut Staat) {
         let r = info.rcMonitor;
         staat.volledig_scherm = true;
         staat.volledig_uit = Some(true);
-        let _ = SetWindowLongPtrW(hwnd, GWL_STYLE, WS_POPUP.0 as isize);
+        // GWL_STYLE vervangt alle stijlbits: zonder WS_VISIBLE is het venster daarna
+        // onzichtbaar en blijft op het scherm staan wat er toevallig stond.
+        let _ = SetWindowLongPtrW(hwnd, GWL_STYLE, (WS_POPUP | WS_VISIBLE).0 as isize);
         // Nooit activeren: bij een vanzelf geopend venster mag dit de focus niet pakken.
         let _ = SetWindowPos(
             hwnd,
