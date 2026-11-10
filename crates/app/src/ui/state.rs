@@ -749,8 +749,6 @@ pub struct Constants {
     pub sound_events: Vec<SoundEventInfo>,
     pub control_port: u16,
     pub media_port: u16,
-    pub autostart: bool,
-    pub minimize_to_tray: bool,
 }
 
 fn reply_snippet(body: &str) -> String {
@@ -1141,8 +1139,8 @@ impl UiState {
             code_result: snap.codes_uitslag.as_ref().map(code_result_line),
             download_dir: snap.download_dir.display().to_string(),
             pictures_dir: snap.pictures_dir.display().to_string(),
-            autostart: c.autostart,
-            minimize_to_tray: c.minimize_to_tray,
+            autostart: snap.autostart,
+            minimize_to_tray: snap.minimize_to_tray,
             timeline_revision,
         }
     }
@@ -1920,12 +1918,22 @@ mod tests {
             sound_events: Vec::new(),
             control_port: 1,
             media_port: 2,
-            autostart: false,
-            minimize_to_tray: true,
         };
         let state = UiState::build(&Snapshot::default(), &constants, 7, &HashMap::new());
         let back: UiState = serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
         assert_eq!(back, state);
+
+        // Account switches must follow each engine update without recreating constants.
+        for (autostart, minimize_to_tray) in [(true, false), (false, true)] {
+            let snap = Snapshot {
+                autostart,
+                minimize_to_tray,
+                ..Default::default()
+            };
+            let updated = UiState::build(&snap, &constants, 8, &HashMap::new());
+            assert_eq!(updated.autostart, autostart);
+            assert_eq!(updated.minimize_to_tray, minimize_to_tray);
+        }
 
         let op = OpRef::of(OpId::new(peer(2), Channel::GENERAL, 3));
         let items = vec![

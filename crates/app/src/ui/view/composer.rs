@@ -1153,8 +1153,6 @@ pub(super) mod window_tests {
                 sound_events: Vec::new(),
                 control_port: 0,
                 media_port: 0,
-                autostart: false,
-                minimize_to_tray: false,
             };
             let mut state = UiState::build(&Snapshot::default(), &constants(), 0, &HashMap::new());
             state.peers = vec![
@@ -1171,7 +1169,6 @@ pub(super) mod window_tests {
                 me,
                 fallback_name: "Alice".into(),
                 youtube_dir: PathBuf::from("/nonexistent"),
-                minimize_to_tray: false,
                 constants: constants(),
                 sources: Mutex::new(Vec::new()),
                 dropped: Mutex::new(Vec::new()),
