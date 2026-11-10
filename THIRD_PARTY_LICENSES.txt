@@ -44356,8 +44356,8 @@ have been licensed under extremely permissive terms.
 Copyright notices are retained in src/* files where relevant.
 
 
-=== libsqlite3-sys 0.38.1 | MIT ===
-https://crates.io/crates/libsqlite3-sys/0.38.1
+=== libsqlite3-sys 0.39.1 | MIT ===
+https://crates.io/crates/libsqlite3-sys/0.39.1
 --- LICENSE ---
 Copyright (c) 2014 The rusqlite developers
 
@@ -68186,8 +68186,8 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
 
-=== rusqlite 0.40.1 | MIT ===
-https://crates.io/crates/rusqlite/0.40.1
+=== rusqlite 0.41.1 | MIT ===
+https://crates.io/crates/rusqlite/0.41.1
 --- LICENSE ---
 Copyright (c) 2014 The rusqlite developers
 

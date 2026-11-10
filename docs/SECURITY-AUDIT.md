@@ -190,3 +190,9 @@ or a different final release build still require the release validation procedur
   system media decoders or every GPUI dependency, and did not perform a two-machine
   Windows/macOS adversarial network test. Test results and final release validation
   must be recorded separately; added tests are not assumed to have passed.
+
+## 1.18.3 dependency update — 2026-11-10
+
+The release check found [RUSTSEC-2026-0459](https://rustsec.org/advisories/RUSTSEC-2026-0459.html), issued on 2026-11-09. Opening an attacker-controlled SQLite database and mismatched sibling WAL file can expose uninitialized process memory. FitCom 1.18.3 upgrades `rusqlite` to 0.41.1 and `libsqlite3-sys` to 0.39.1, bundling patched SQLite 3.54.1. The third-party license texts were compared with the new packaged sources and remain identical; their version references are updated.
+
+The locked Windows and Apple Silicon macOS dependency graphs pass `cargo deny check -W unmaintained`: advisories, bans, licenses and sources pass. Maintenance and duplicate-version diagnostics remain warnings. No advisory exceptions were added. Protocol 6 and the unresolved operation-author finding above remain unchanged in this compatibility patch.
