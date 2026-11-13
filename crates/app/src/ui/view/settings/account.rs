@@ -1,4 +1,4 @@
-//! The Account tab: display name, status, identity, the two config-file switches, version
+//! The Account tab: display name, status, identity, startup and tray preferences, version
 //! and the update check. Applying an update is the status bar's chip, not this tab's.
 
 use super::controls::{
@@ -12,7 +12,7 @@ use crate::ui::view::widgets::{avatar, face, Btn, BtnKind};
 use crate::ui::view::AppSnapshot;
 use gpui_kit::{
     div, prelude::FluentBuilder, px, relative, ClipboardItem, Context, IntoElement, ParentElement,
-    Styled, Window,
+    Styled, TestSupportExt, Window,
 };
 use std::rc::Rc;
 
@@ -63,6 +63,15 @@ impl SettingsPane {
         let (ui_share, share) = (snap.ui.clone(), s.share_activity);
         let share_toggle = Rc::new(move |_: &_, _: &mut _, _: &mut _| {
             commands::set_share_activity(&ui_share, !share)
+        });
+
+        let (ui_start, autostart) = (snap.ui.clone(), s.autostart);
+        let start_toggle = Rc::new(move |_: &_, _: &mut _, _: &mut _| {
+            commands::set_autostart(&ui_start, !autostart)
+        });
+        let (ui_tray, minimize_to_tray) = (snap.ui.clone(), s.minimize_to_tray);
+        let tray_toggle = Rc::new(move |_: &_, _: &mut _, _: &mut _| {
+            commands::set_minimize_to_tray(&ui_tray, !minimize_to_tray)
         });
 
         Body::new()
@@ -167,26 +176,19 @@ impl SettingsPane {
             )
             .field(switch_row(
                 "Start with Windows",
-                &[
-                    Piece::Text("Set in "),
-                    Piece::Mono("config.toml"),
-                    Piece::Text(" and applied at every start."),
-                ],
+                &[Piece::Text("Launch automatically when you sign in to Windows.")],
                 "set-autostart",
                 s.autostart,
+                start_toggle,
             ))
             .field(switch_row(
                 "Close button hides to tray",
-                &[
-                    Piece::Text(concat!(
-                        "On by default, so closing the window does not stop the app while you are ",
-                        "gaming. Set in "
-                    )),
-                    Piece::Mono("config.toml"),
-                    Piece::Text("."),
-                ],
+                &[Piece::Text(
+                    "Keep the app running in the tray when you close the window.",
+                )],
                 "set-tray",
                 s.minimize_to_tray,
+                tray_toggle,
             ))
             .field(
                 div()
@@ -218,13 +220,13 @@ impl SettingsPane {
     }
 }
 
-/// A label and its help on the left, a switch on the right. Both of these are settings of
-/// `config.toml`, so the switch has no handler.
+/// A label and its help on the left, a live preference switch on the right.
 fn switch_row(
     title: &'static str,
     help_text: &[Piece],
     id: &'static str,
     on: bool,
+    on_click: Rc<dyn Fn(&gpui_kit::ClickEvent, &mut Window, &mut gpui_kit::App)>,
 ) -> impl IntoElement {
     div()
         .flex()
@@ -236,7 +238,7 @@ fn switch_row(
                 .child(label(title).mb(px(2.)))
                 .child(help_rich(help_text)),
         )
-        .child(switch(id, on, None))
+        .child(switch(id, on, Some(on_click)).test_support())
 }
 
 #[cfg(test)]

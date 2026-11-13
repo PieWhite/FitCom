@@ -492,6 +492,53 @@ fn text_field(input: &Entity<InputState>, width: f32) -> impl IntoElement {
 mod tests {
     use super::should_pull_name;
 
+    #[gpui_kit::test]
+    fn account_switches_send_commands_in_both_directions(cx: &mut gpui_kit::TestAppContext) {
+        use crate::engine::UiCommand;
+        use crate::ui::view::composer::window_tests::Harness;
+        use crate::ui::view::{SettingsTab, View};
+        use gpui_kit::test::TestWindowExt;
+        use std::sync::Arc;
+
+        let mut h = Harness::new(cx);
+        for on in [false, true] {
+            h.app.update(cx, |app, cx| {
+                let mut s = (*app.s).clone();
+                s.autostart = on;
+                s.minimize_to_tray = on;
+                app.s = Arc::new(s);
+                app.v_mut().view = View::Settings;
+                app.v_mut().settings_tab = SettingsTab::Account;
+                cx.notify();
+            });
+            cx.run_until_parked();
+            let pane = h.app.read_with(cx, |app, _| app.panes.settings.clone());
+            h.with_window(cx, |window, cx| {
+                window.render_frame(cx);
+                pane.update(cx, |pane, cx| {
+                    pane.scroll.scroll_to_bottom();
+                    cx.notify();
+                });
+            });
+            cx.run_until_parked();
+            h.drain();
+            h.with_window(cx, |window, cx| {
+                window.render_frame(cx);
+                window.click("set-autostart", cx);
+                window.click("set-tray", cx);
+            });
+            cx.run_until_parked();
+            let commands = h.drain();
+            assert!(
+                matches!(commands.as_slice(),
+                    [UiCommand::ZetAutostart(start), UiCommand::ZetMinimizeToTray(tray)]
+                        if *start == !on && *tray == !on
+                ),
+                "{commands:?}"
+            );
+        }
+    }
+
     #[test]
     fn a_state_event_never_replaces_what_is_being_typed() {
         assert!(

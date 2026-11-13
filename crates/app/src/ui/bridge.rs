@@ -486,8 +486,6 @@ mod tests {
             sound_events: Vec::new(),
             control_port: 0,
             media_port: 0,
-            autostart: false,
-            minimize_to_tray: false,
         };
         let mut s = UiState::build(
             &crate::engine::Snapshot::default(),
@@ -535,8 +533,6 @@ mod tests {
             sound_events: Vec::new(),
             control_port: 0,
             media_port: 0,
-            autostart: false,
-            minimize_to_tray: false,
         };
         let mut s = UiState::build(
             &crate::engine::Snapshot::default(),

@@ -64,7 +64,6 @@ pub struct Ui {
     /// engine because the fetch is triggered by what the window is drawing — see
     /// `commands::youtube_preview` and `crate::youtube`.
     pub youtube_dir: PathBuf,
-    pub minimize_to_tray: bool,
     constants: Constants,
     /// The source list handed to the picker, so "share the third one" resolves to the
     /// same source the user saw. Replaced wholesale every time the picker opens.
@@ -230,8 +229,6 @@ fn constants(me: PeerId, cfg: &Config) -> Constants {
             .collect(),
         control_port: cfg.control_port,
         media_port: cfg.media_port,
-        autostart: cfg.autostart,
-        minimize_to_tray: cfg.minimize_to_tray,
     }
 }
 
@@ -250,7 +247,6 @@ pub fn run(
         me,
         fallback_name: cfg.display_name.clone(),
         youtube_dir,
-        minimize_to_tray: cfg.minimize_to_tray,
         constants: constants(me, cfg),
         sources: Mutex::new(Vec::new()),
         dropped: Mutex::new(Vec::new()),
@@ -314,15 +310,12 @@ pub fn run_fixture(dir: PathBuf) -> anyhow::Result<()> {
         sound_events: s.sound_events.clone(),
         control_port: s.control_port,
         media_port: s.media_port,
-        autostart: s.autostart,
-        minimize_to_tray: false,
     };
     let feeds = bridge::Feeds::fixed(s.clone(), fixture.meters.clone(), fixture.thumbs.clone());
     let ui = Arc::new(Ui {
         me,
         fallback_name: s.me.name.clone(),
         youtube_dir: dir.join("youtube"),
-        minimize_to_tray: false,
         constants,
         sources: Mutex::new(Vec::new()),
         dropped: Mutex::new(Vec::new()),

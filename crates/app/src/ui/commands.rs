@@ -390,6 +390,16 @@ pub fn set_push_to_talk(ui: &Ui, mode: &str, key: &str, threshold: f32) {
     );
 }
 
+/// Apply Windows startup registration and persist the preference through the engine.
+pub fn set_autostart(ui: &Ui, on: bool) {
+    send(ui, UiCommand::ZetAutostart(on));
+}
+
+/// Persist the close-button preference; the window reads the live engine snapshot.
+pub fn set_minimize_to_tray(ui: &Ui, on: bool) {
+    send(ui, UiCommand::ZetMinimizeToTray(on));
+}
+
 /// Whether the game in front is shared as "Playing X" under your name. Saved to
 /// `config.toml` by the engine; off also clears what the others still show.
 pub fn set_share_activity(ui: &Ui, on: bool) {
@@ -975,7 +985,7 @@ pub fn post_wordle_card(ui: &Ui) {
 /// window and leaves the engine running, because the state this app has to be good at is
 /// "away in the tray while a game is running". Returns whether the app should really quit.
 pub fn close_window(ui: &Ui, cx: &mut gpui_kit::App) -> bool {
-    if !ui.minimize_to_tray {
+    if !ui.engine.snapshot.borrow().minimize_to_tray {
         return true;
     }
     // Hidden is not in the foreground: the engine decides on notifications with this.

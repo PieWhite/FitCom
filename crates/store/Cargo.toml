@@ -9,10 +9,10 @@ repository.workspace = true
 [dependencies]
 anyhow = "1.0.104"
 fitcom-proto.workspace = true
-rusqlite = { version = "0.40.1", features = ["bundled"] }
+rusqlite = { version = "0.41.0", features = ["bundled"] }
 tracing = "0.1.44"
 
 [dev-dependencies]
 # Voor de migratietest: die zet een schema-v1-database met de hand in elkaar, met de
 # ruwe tabelvorm van vóór de kanalen-uitbreiding.
-rusqlite = { version = "0.40.1", features = ["bundled"] }
+rusqlite = { version = "0.41.0", features = ["bundled"] }

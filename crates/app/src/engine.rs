@@ -261,6 +261,9 @@ pub struct Snapshot {
     pub push_to_talk: PushToTalkConfig,
     /// Meesturen welk spel er vooraan staat (`Config::share_activity`).
     pub deel_activiteit: bool,
+    /// Live account preferences, also used by the window close handler.
+    pub autostart: bool,
+    pub minimize_to_tray: bool,
     /// Het spel dat bij ons vooraan staat (`speelt::Rust::huidig`), voor "Stream <spel>".
     pub eigen_spel: Option<String>,
     /// Mogen kijkers op je scherm tekenen (`Config::allow_drawing`): de standaard voor een
@@ -348,6 +351,9 @@ pub enum UiCommand {
     ZetStatus(u8),
     /// "Speelt X" meesturen aan of uit; wordt weggeschreven naar `config.toml`.
     ZetActiviteitDelen(bool),
+    /// Apply startup registration and persist the account preferences.
+    ZetAutostart(bool),
+    ZetMinimizeToTray(bool),
     Gelezen,
     /// Een DM-gesprek is bekeken; telt niet mee voor `Snapshot::ongelezen_dm`.
     GelezenDm(PeerId),
@@ -2608,6 +2614,29 @@ impl Engine {
             }
             UiCommand::Typing(channel) => self.stuur_typing(channel),
             UiCommand::ZetStatus(status) => self.zet_status(status),
+            UiCommand::ZetAutostart(aan) => {
+                if let Err(e) = crate::tray::zet_autostart(aan) {
+                    self.fout = Some(format!("autostart instellen: {e:#}"));
+                } else {
+                    let previous = self.cfg.autostart;
+                    self.cfg.autostart = aan;
+                    if let Err(e) = self.cfg.save(&self.config_path) {
+                        self.cfg.autostart = previous;
+                        if let Err(rollback) = crate::tray::zet_autostart(previous) {
+                            tracing::warn!(error = %rollback, "autostart rollback failed");
+                        }
+                        self.fout = Some(format!("config opslaan: {e:#}"));
+                    }
+                }
+            }
+            UiCommand::ZetMinimizeToTray(aan) => {
+                let previous = self.cfg.minimize_to_tray;
+                self.cfg.minimize_to_tray = aan;
+                if let Err(e) = self.cfg.save(&self.config_path) {
+                    self.cfg.minimize_to_tray = previous;
+                    self.fout = Some(format!("config opslaan: {e:#}"));
+                }
+            }
             UiCommand::ZetActiviteitDelen(aan) => {
                 if self.cfg.share_activity != aan {
                     self.cfg.share_activity = aan;
@@ -4067,6 +4096,8 @@ impl Engine {
             tekenen: self.cfg.allow_drawing,
             bedienen: self.cfg.allow_remote_control && BEDIENEN_KAN,
             auto_popout: self.cfg.auto_popout,
+            autostart: self.cfg.autostart,
+            minimize_to_tray: self.cfg.minimize_to_tray,
             popout_monitor: self.cfg.popout_monitor.clone(),
             overlay: self.cfg.overlay.clone(),
             input_device: self.cfg.input_device.clone(),

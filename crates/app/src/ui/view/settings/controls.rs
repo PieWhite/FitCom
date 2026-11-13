@@ -501,8 +501,7 @@ type KeyHandler = Rc<dyn Fn(&KeyDownEvent, &mut Window, &mut App)>;
 // ------------------------------------------------------------------ switch
 
 /// A 38x22 pill, the knob jumps 16px: chrome with a void knob when on, a lift with an ash
-/// knob when off. A switch with no handler is the disabled kind the account tab shows for
-/// the two config-file settings.
+/// knob when off. A switch with no handler is read-only.
 pub fn switch(id: &'static str, on: bool, on_click: Option<Handler>) -> Stateful<Div> {
     div()
         .id(id)
