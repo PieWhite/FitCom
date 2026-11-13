@@ -118,6 +118,9 @@ struct Gedeeld {
     /// sessie te herstarten.
     spreekmodus: AtomicU8,
     spreektoets: AtomicU16,
+    /// Minimaal niveau (RMS, 0..1, `f32` via `to_bits`) waarboven de VAD mag openen. `0` =
+    /// alleen de VAD. Handmatig tegen achtergrondgeluid dat RNNoise voor spraak aanziet.
+    drempel: AtomicU32,
     /// `f32` via `to_bits`, zodat de UI hem zonder lock kan uitlezen.
     eigen_niveau: AtomicU32,
     eigen_spreekt: AtomicBool,
@@ -213,6 +216,19 @@ impl VoiceHandle {
         self.gedeeld
             .spreekmodus
             .store(modus.als_u8(), Ordering::Relaxed);
+    }
+
+    /// Het minimale microfoonniveau (RMS, 0..1) waarboven spraakdetectie mag openen.
+    /// Push-to-talk gaat er net als bij de VAD overheen. Geldt vanaf het volgende blok.
+    pub fn zet_drempel(&self, niveau: f32) {
+        let niveau = if niveau.is_finite() {
+            niveau.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        self.gedeeld
+            .drempel
+            .store(niveau.to_bits(), Ordering::Relaxed);
     }
 
     /// Volume van iemands stem.
@@ -371,6 +387,7 @@ pub fn start(cfg: VoiceConfig) -> Result<VoiceHandle> {
         deafen: AtomicBool::new(false),
         spreekmodus: AtomicU8::new(Modus::Spraak.als_u8()),
         spreektoets: AtomicU16::new(0),
+        drempel: AtomicU32::new(0),
         eigen_niveau: AtomicU32::new(0),
         eigen_spreekt: AtomicBool::new(false),
         stop: AtomicBool::new(false),
@@ -702,7 +719,8 @@ fn opname_lus(
         while op48.len() >= blok {
             let invoer: Vec<f32> = op48.drain(..blok).collect();
             let kans = ruis.process_frame(&mut uit_blok, &invoer);
-            if kans > VAD_DREMPEL {
+            let drempel = f32::from_bits(gedeeld.drempel.load(Ordering::Relaxed));
+            if kans > VAD_DREMPEL && rms(&uit_blok) / 32768.0 >= drempel {
                 hangover = HANGOVER_FRAMES;
             }
             schoon.extend_from_slice(&uit_blok);
@@ -731,10 +749,13 @@ fn opname_lus(
             timestamp = timestamp.wrapping_add(FRAME_SAMPLES as u32);
             if gedeeld.mute.load(Ordering::Relaxed) || !praat {
                 // Niets versturen. Dat is precies waarom de app in rust vrijwel geen
-                // verkeer en geen CPU gebruikt.
-                gedeeld
-                    .eigen_niveau
-                    .store(0f32.to_bits(), Ordering::Relaxed);
+                // verkeer en geen CPU gebruikt. Het niveau blijft wél zichtbaar als de poort
+                // dicht is (niet op mute): zo stel je de drempel in tegen je eigen ruis.
+                if gedeeld.mute.load(Ordering::Relaxed) {
+                    gedeeld
+                        .eigen_niveau
+                        .store(0f32.to_bits(), Ordering::Relaxed);
+                }
                 continue;
             }
 

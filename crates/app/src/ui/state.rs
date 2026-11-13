@@ -334,6 +334,9 @@ pub enum TimelineItem {
         reply_snippet: Option<ReplySnippet>,
         /// Reactions grouped per emoji, in the same order every peer folds them to.
         reactions: Vec<ReactionState>,
+        /// Pinned in this conversation (shared, see `OpKind::Pin`).
+        #[serde(default)]
+        pinned: bool,
     },
     File {
         id: OpRef,
@@ -535,6 +538,9 @@ pub struct PushToTalkState {
     /// False where the platform cannot read a global key (macOS): the tab says so and the
     /// engine keeps to voice activity.
     pub available: bool,
+    /// Minimum input level for voice activity, 0..100% of the settings meter.
+    #[serde(default)]
+    pub threshold: f32,
 }
 
 impl Default for PushToTalkState {
@@ -544,6 +550,7 @@ impl Default for PushToTalkState {
             mode: c.mode,
             key: c.key,
             available: fitcom_audio::spreektoets::BESCHIKBAAR,
+            threshold: c.threshold,
         }
     }
 }
@@ -1082,6 +1089,7 @@ impl UiState {
                 mode: snap.push_to_talk.mode.clone(),
                 key: snap.push_to_talk.key.clone(),
                 available: fitcom_audio::spreektoets::BESCHIKBAAR,
+                threshold: snap.push_to_talk.threshold,
             },
             share_activity: snap.deel_activiteit,
             allow_drawing: snap.tekenen,
@@ -1298,6 +1306,7 @@ pub fn timeline_of(
                 reply_to: m.reply_to.map(OpRef::of),
                 reply_snippet: snippet,
                 reactions: reactions_of(m.id),
+                pinned: snap.timeline.pins.contains(&m.id),
             },
         ));
     }
@@ -1950,6 +1959,7 @@ mod tests {
                     peers: vec![peer(1).to_string()],
                     mine: true,
                 }],
+                pinned: true,
             },
             TimelineItem::File {
                 id: op,

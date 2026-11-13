@@ -63,6 +63,8 @@ pub struct SettingsPane {
     clip_quality: Choices,
     bitrate: Ranged,
     sound_volume: Ranged,
+    /// Minimum input level for voice activity, in percent of the input level bar.
+    mic_threshold: Ranged,
     /// The clip shortcut box; it has focus exactly while it is listening.
     hotkey_focus: FocusHandle,
     /// Modifiers held while listening, for the "ctrl+..." text.
@@ -88,6 +90,7 @@ impl SettingsPane {
         let clip_quality = Choices::new(window, cx);
         let bitrate = Ranged::new(4., 40., cx);
         let sound_volume = Ranged::new(0., 100., cx);
+        let mic_threshold = Ranged::new(0., 100., cx);
         let hotkey_focus = cx.focus_handle().tab_stop(true);
 
         let mut subscriptions = vec![
@@ -113,7 +116,7 @@ impl SettingsPane {
                     let SelectEvent::Confirm(Some(label)) = ev else {
                         return;
                     };
-                    this.commit_ptt(None, audio::ptt_key_name(label), cx);
+                    this.commit_ptt(None, audio::ptt_key_name(label), None, cx);
                 },
             ),
             cx.subscribe(
@@ -202,6 +205,12 @@ impl SettingsPane {
                 }
                 cx.notify();
             }),
+            cx.subscribe(&mic_threshold.state, |this, _, ev: &SliderEvent, cx| {
+                if let Some(percent) = this.mic_threshold.event(ev) {
+                    this.commit_ptt(None, None, Some(percent), cx);
+                }
+                cx.notify();
+            }),
             // Clicking away from the shortcut box ends the listening.
             cx.on_blur(&hotkey_focus, window, |this, _, cx| {
                 this.pending_mods.clear();
@@ -216,6 +225,7 @@ impl SettingsPane {
         // The sliders redraw themselves; the pane redraws for the readout beside them.
         subscriptions.push(cx.observe(&bitrate.state, |_, _, cx| cx.notify()));
         subscriptions.push(cx.observe(&sound_volume.state, |_, _, cx| cx.notify()));
+        subscriptions.push(cx.observe(&mic_threshold.state, |_, _, cx| cx.notify()));
 
         SettingsPane {
             app: init.app.clone(),
@@ -235,6 +245,7 @@ impl SettingsPane {
             clip_quality,
             bitrate,
             sound_volume,
+            mic_threshold,
             hotkey_focus,
             pending_mods: String::new(),
             scroll: ScrollHandle::new(),
@@ -253,13 +264,24 @@ impl SettingsPane {
         );
     }
 
-    /// A new mode, a new key, or both. What is not given stays what the engine has.
-    fn commit_ptt(&self, mode: Option<&str>, key: Option<&str>, cx: &mut Context<Self>) {
+    /// A new mode, key or threshold. What is not given stays what the engine has.
+    fn commit_ptt(
+        &self,
+        mode: Option<&str>,
+        key: Option<&str>,
+        threshold: Option<f32>,
+        cx: &mut Context<Self>,
+    ) {
         let Some(snap) = self.app.snapshot(cx) else {
             return;
         };
         let now = &snap.s.push_to_talk;
-        commands::set_push_to_talk(&snap.ui, mode.unwrap_or(&now.mode), key.unwrap_or(&now.key));
+        commands::set_push_to_talk(
+            &snap.ui,
+            mode.unwrap_or(&now.mode),
+            key.unwrap_or(&now.key),
+            threshold.unwrap_or(now.threshold),
+        );
     }
 
     /// A new clip frame rate, resolution or quality. What is not given stays what the

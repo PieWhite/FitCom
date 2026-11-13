@@ -82,6 +82,14 @@ pub fn react_message(ui: &Ui, op: &OpRef, emoji: &str) {
     send(ui, UiCommand::Reageer(id, emoji));
 }
 
+/// Pin a message in its conversation, or unpin it if it is pinned. Shared with everyone
+/// there; the toggle lives in the chat layer.
+pub fn pin_message(ui: &Ui, op: &OpRef) {
+    if let Some(id) = op.to_op_id() {
+        send(ui, UiCommand::Pin(id));
+    }
+}
+
 /// "I am typing in this conversation." Fire-and-forget and throttled on the engine side;
 /// the composer may call it on every keystroke.
 pub fn notify_typing(ui: &Ui, channel: &str) {
@@ -369,13 +377,15 @@ pub fn set_sound_settings(ui: &Ui, set: &str, volume: f32) {
 
 /// How the microphone gate works and which key operates it. Saved to `config.toml` by the
 /// engine and live at once, also in a running call. `mode` is `voice`, `talk` or `mute`;
-/// `key` is a name from `fitcom_audio::spreektoets::TOETSEN`.
-pub fn set_push_to_talk(ui: &Ui, mode: &str, key: &str) {
+/// `key` is a name from `fitcom_audio::spreektoets::TOETSEN`; `threshold` is the input
+/// level (0..100% of the settings meter) below which voice activity stays closed.
+pub fn set_push_to_talk(ui: &Ui, mode: &str, key: &str, threshold: f32) {
     send(
         ui,
         UiCommand::ZetSpreektoets(crate::config::PushToTalkConfig {
             mode: mode.to_string(),
             key: key.to_string(),
+            threshold,
         }),
     );
 }

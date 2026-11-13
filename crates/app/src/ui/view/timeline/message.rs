@@ -209,6 +209,9 @@ fn render_message(
         });
 
     let mut body = div().flex_1().min_w_0().relative().flex().flex_col();
+    if let TimelineItem::Message { pinned: true, .. } = item {
+        body = body.child(pinned_mark());
+    }
     if let TimelineItem::Message {
         reply_to: Some(_), ..
     } = item
@@ -294,6 +297,17 @@ fn render_message(
         .child(body)
         .when(hovered, |d| d.child(actions(ctx, ix, item, &key)))
         .into_any_element()
+}
+
+fn pinned_mark() -> Div {
+    div()
+        .flex()
+        .items_center()
+        .gap(px(4.))
+        .text_size(px(10.))
+        .text_color(theme::TEXT_MUTED)
+        .child(Icon::Pin.size(11.))
+        .child("Pinned")
 }
 
 fn edited_mark() -> Div {
@@ -669,6 +683,16 @@ fn actions(ctx: &RowCtx, ix: usize, item: &TimelineItem, key: &SharedString) -> 
                         .group_hover(group, |s| s.visible())
                         .child("🙂"),
                 ),
+        );
+    }
+    if let TimelineItem::Message { pinned, .. } = item {
+        let (ui, op) = (ctx.snap.ui.clone(), id.clone());
+        strip = strip.child(
+            plain(button("pin"))
+                .tooltip(tooltip(if *pinned { "Unpin" } else { "Pin" }))
+                .when(*pinned, |d| d.text_color(theme::TEXT_STRONG))
+                .on_click(move |_, _, _| commands::pin_message(&ui, &op))
+                .child(Icon::Pin.size(15.)),
         );
     }
     if mine && message_body.is_some() {

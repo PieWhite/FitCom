@@ -340,6 +340,8 @@ pub enum UiCommand {
     Verwijder(OpId),
     /// Reactie op een bericht zetten of (als hij er al staat) intrekken.
     Reageer(OpId, String),
+    /// Bericht vastpinnen of (als het al vastzit) losmaken.
+    Pin(OpId),
     /// "Ik ben aan het typen" in dit kanaal. Vluchtig; de motor throttle zelf.
     Typing(Channel),
     /// Eigen aanwezigheidsstatus: 0 online, 1 away, 2 busy (`UserStatusValue`).
@@ -1533,6 +1535,7 @@ impl Engine {
                 }
                 let (modus, vk) = self.cfg.push_to_talk.voor_audio();
                 h.zet_spreektoets(modus, vk);
+                h.zet_drempel(self.cfg.push_to_talk.drempel());
                 self.voice = Some(h);
                 self.geluid(geluid::Geluid::EigenJoin);
                 self.werk_voice_peers_bij();
@@ -2599,6 +2602,10 @@ impl Engine {
                 let r = self.chat.reageer(doel, &emoji);
                 self.verwerk(r);
             }
+            UiCommand::Pin(doel) => {
+                let r = self.chat.pin(doel);
+                self.verwerk(r);
+            }
             UiCommand::Typing(channel) => self.stuur_typing(channel),
             UiCommand::ZetStatus(status) => self.zet_status(status),
             UiCommand::ZetActiviteitDelen(aan) => {
@@ -2932,6 +2939,7 @@ impl Engine {
                 if let Some(v) = &self.voice {
                     let (modus, vk) = self.cfg.push_to_talk.voor_audio();
                     v.zet_spreektoets(modus, vk);
+                    v.zet_drempel(self.cfg.push_to_talk.drempel());
                 }
             }
             UiCommand::ProefGeluid(naam) => match geluid::Geluid::van_naam(&naam) {

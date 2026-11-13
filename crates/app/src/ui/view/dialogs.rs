@@ -487,19 +487,6 @@ fn lightbox(
         .px(px(14.))
         .py(px(12.))
         .child(
-            Btn::new(
-                "lightbox-size",
-                if actual_size {
-                    "Fit to window"
-                } else {
-                    "Actual size"
-                },
-            )
-            .kind(BtnKind::Ghost)
-            .dialog()
-            .on_click(toggle_size(&snap.app)),
-        )
-        .child(
             Btn::new("lightbox-open", "Open")
                 .kind(BtnKind::Ghost)
                 .dialog()

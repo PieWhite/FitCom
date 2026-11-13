@@ -73,11 +73,16 @@ impl SettingsPane {
         self.ptt_key.sync(ptt_key_labels(), key_label, window, cx);
         self.sound_volume
             .sync(format::vol_pct(s.sound.volume) as f32, window, cx);
+        self.mic_threshold.sync(ptt.threshold.round(), window, cx);
+        // The thumb, not the engine, while it is being dragged: the marker follows the hand.
+        let threshold_now = self.mic_threshold.value(cx);
 
         let audible = s.sound.volume > 0.;
         let volume_now = self.sound_volume.value(cx);
 
-        let level = meter_view("input-level", &snap.meters, window, cx, |m, _, _| {
+        // Green while voice goes out, grey while the gate holds it back; the line is the
+        // threshold, so you can set it just above your own background noise.
+        let level = meter_view("input-level", &snap.meters, window, cx, move |m, _, _| {
             div()
                 .relative()
                 .w_full()
@@ -89,8 +94,23 @@ impl SettingsPane {
                     div()
                         .h_full()
                         .w(relative((m.self_level() * 3.).clamp(0., 1.)))
-                        .bg(theme::ONLINE),
+                        .bg(if m.self_speaking() {
+                            theme::ONLINE
+                        } else {
+                            theme::TEXT_DIM
+                        }),
                 )
+                .when(threshold_now > 0., |d| {
+                    d.child(
+                        div()
+                            .absolute()
+                            .top_0()
+                            .bottom_0()
+                            .left(relative(threshold_now / 100.))
+                            .w(px(2.))
+                            .bg(theme::TEXT_STRONG),
+                    )
+                })
                 .into_any_element()
         });
 
@@ -106,9 +126,9 @@ impl SettingsPane {
 
         // A mode button sends the new mode with the key the engine has now.
         let mode_button = |mode: &'static str| {
-            let (ui, key) = (snap.ui.clone(), ptt.key.clone());
+            let (ui, key, threshold) = (snap.ui.clone(), ptt.key.clone(), ptt.threshold);
             move |_: &gpui_kit::ClickEvent, _: &mut Window, _: &mut gpui_kit::App| {
-                commands::set_push_to_talk(&ui, mode, &key)
+                commands::set_push_to_talk(&ui, mode, &key, threshold)
             }
         };
         let sets = div()
@@ -220,6 +240,31 @@ impl SettingsPane {
                         "speaking. When you are quiet, nothing goes over the line."
                     )))
                     .child(div().mt(px(6.)).max_w(px(320.)).child(level)),
+            )
+            .field(
+                div()
+                    .child(label("Input threshold"))
+                    .child(help(concat!(
+                        "Background noise that still gets through? Raise this until the bar stays ",
+                        "grey while you are quiet and turns green when you talk. Only works in a ",
+                        "call, and push to talk always goes past it. Zero leaves it to voice ",
+                        "activity alone."
+                    )))
+                    .child(
+                        control_row()
+                            .child(Range::new(&self.mic_threshold, 280.).on_key(cx.listener(
+                                |this, ev: &KeyDownEvent, window, cx| {
+                                    if let Some(v) = this.mic_threshold.key_target(ev, cx) {
+                                        this.mic_threshold
+                                            .state
+                                            .update(cx, |s, cx| s.set_value(v, window, cx));
+                                        this.commit_ptt(None, None, Some(v), cx);
+                                        cx.stop_propagation();
+                                    }
+                                },
+                            )))
+                            .child(readout(format!("{}%", threshold_now.round() as u32))),
+                    ),
             )
             .h2("Push to talk")
             .p(concat!(

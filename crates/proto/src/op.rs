@@ -322,6 +322,12 @@ op_kinds! {
     // verkleind; de ontvanger controleert formaat en afmeting zelf voordat hij hem op
     // schijf zet (`crate::avatar` in de app). Additief, geen protocolbump.
     32 => SetAvatar { image: serde_bytes::ByteBuf },
+    // Een bericht vastpinnen in zijn kanaal (2026-11-13). Gedeeld: per doel wint de laatste
+    // `(lamport, author)`, ongeacht wie — iedereen mag pinnen en losmaken, zoals bij een
+    // reactie. Zelfde kanaalregel als `React` (zie `fitcom_store::timeline`). Additief, geen
+    // protocolbump: een oudere peer bewaart en verspreidt hem zonder hem te tonen. Bewust
+    // niet in 12-19, die reeks is gereserveerd.
+    33 => Pin { target: OpId, remove: bool },
     // Nieuwe soorten toevoegen kost geen migratie — dat is het hele punt van deze opzet.
 }
 
@@ -355,6 +361,7 @@ impl OpKind {
                 })
             }
             Self::SetAvatar { .. } => Ok(()),
+            Self::Pin { .. } => Ok(()),
         }
     }
 }
@@ -505,6 +512,10 @@ mod tests {
                 target: OpId::new(peer(2), Channel::GENERAL, 3),
                 emoji: "👍".into(),
                 remove: false,
+            },
+            OpKind::Pin {
+                target: OpId::new(peer(2), Channel::GENERAL, 3),
+                remove: true,
             },
             OpKind::WordleResult {
                 day: 20_260_820,

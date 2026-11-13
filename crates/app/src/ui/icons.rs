@@ -93,6 +93,7 @@ icons! {
     EyeOff => "eye-off",
     /// Remote control of a shared monitor (decision 54).
     Pointer => "pointer",
+    Pin => "pin",
 }
 
 impl Icon {

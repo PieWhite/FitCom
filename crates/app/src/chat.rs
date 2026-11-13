@@ -161,6 +161,19 @@ impl Chat {
         )
     }
 
+    /// Pint een bericht vast in zijn kanaal, of maakt hem los als hij nu vastzit. Gedeeld:
+    /// voor iedereen in het kanaal.
+    pub fn pin(&mut self, doel: OpId) -> Result<Vec<MeshCommand>> {
+        let vast = self.timeline().pins.contains(&doel);
+        self.eigen_op(
+            doel.channel,
+            OpKind::Pin {
+                target: doel,
+                remove: vast,
+            },
+        )
+    }
+
     /// Kanaal komt van `doel.channel`: een bewerking hoort per definitie in hetzelfde
     /// kanaal als het bericht dat hij bewerkt, anders zou de store hem straks negeren
     /// (zie `fitcom_store::timeline`) en in het DM-geval zou het origineel ook nog eens

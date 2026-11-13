@@ -102,7 +102,8 @@ impl MembersPane {
             let state = cx.new(|_| {
                 SliderState::new()
                     .min(0.)
-                    .max(100.)
+                    // Up to 200%: the audio session clamps to 0..2 and the mixer clips safely.
+                    .max(200.)
                     .step(1.)
                     .default_value(value as f32)
             });
@@ -390,7 +391,12 @@ fn vol_num(value: u32) -> Div {
         .justify_end()
         .font_family(theme::MONO_FONT)
         .text_size(theme::LABEL_TEXT)
-        .text_color(theme::TEXT_MUTED)
+        // Amber above 100%: this person is boosted, not at their own level.
+        .text_color(if value > 100 {
+            theme::CONNECTING
+        } else {
+            theme::TEXT_MUTED
+        })
         .child(format!("{value}%"))
 }
 
@@ -399,6 +405,11 @@ fn vol_num(value: u32) -> Div {
 /// GPUI paints a border over the children, and the thumb must cover it.
 fn range(state: &Entity<SliderState>, cx: &App) -> impl IntoElement {
     let pct = state.read(cx).percentage().end.clamp(0., 1.);
+    let fill = if state.read(cx).value().end() > 100. {
+        theme::CONNECTING
+    } else {
+        theme::ACCENT
+    };
     BaseSlider::new(state)
         .flex_1()
         .min_w_0()
@@ -444,7 +455,7 @@ fn range(state: &Entity<SliderState>, cx: &App) -> impl IntoElement {
                                         .left_0()
                                         .w(relative(pct))
                                         .rounded_full()
-                                        .bg(theme::ACCENT),
+                                        .bg(fill),
                                 )
                                 .child(
                                     SliderThumb::new(state)

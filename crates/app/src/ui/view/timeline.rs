@@ -20,13 +20,14 @@ use super::super::icons::Icon;
 use super::super::state::{OpRef, PeerState, TimelineItem};
 use super::super::theme::{self, c};
 use super::super::Ui;
-use super::widgets::{icon_btn, pane_head, pane_title, tooltip};
+use super::widgets::{icon_btn, pane_head, pane_title, tooltip, Btn};
 use super::{format, markup, AppHandle, AppSnapshot, PaneInit, View};
 use gpui_kit::base::{Scrollbar, ScrollbarMode};
+use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::{
-    div, list, prelude::FluentBuilder, px, AnyElement, App, Context, IntoElement, ListAlignment,
-    ListState, ParentElement, Pixels, Point, Render, StatefulInteractiveElement, Styled,
-    WeakEntity, Window,
+    div, list, prelude::FluentBuilder, px, AnyElement, App, AppContext, Context, Entity,
+    InteractiveElement, IntoElement, ListAlignment, ListState, ParentElement, Pixels, Point,
+    Render, StatefulInteractiveElement, Styled, Subscription, WeakEntity, Window,
 };
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -177,12 +178,23 @@ pub struct TimelinePane {
     /// The press that closed the emoji bar from outside, so the click it ends on the same
     /// message's react button does not open it again (`data-react-open` toggled).
     emoji_closed_by: Option<(OpRef, Point<Pixels>)>,
+    /// The search panel's query; focused each time the panel opens.
+    search: Entity<InputState>,
+    search_was_open: bool,
+    _search_changes: Subscription,
     #[cfg(debug_assertions)]
     debug: Option<super::super::fixture::DebugView>,
 }
 
 impl TimelinePane {
-    pub fn new(init: &PaneInit, _window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(init: &PaneInit, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let search =
+            cx.new(|cx| InputState::new(window, cx).placeholder("Search this conversation"));
+        let search_changes = cx.subscribe(&search, |_, _, ev: &InputEvent, cx| {
+            if let InputEvent::Change = ev {
+                cx.notify();
+            }
+        });
         TimelinePane {
             app: init.app.clone(),
             ui: init.ui.clone(),
@@ -195,6 +207,9 @@ impl TimelinePane {
             yt: HashMap::new(),
             dj: false,
             emoji_closed_by: None,
+            search,
+            search_was_open: false,
+            _search_changes: search_changes,
             #[cfg(debug_assertions)]
             debug: super::super::fixture::DebugView::from_env(),
         }
@@ -412,7 +427,7 @@ pub(super) struct RowCtx {
 }
 
 impl Render for TimelinePane {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let Some(snap) = self.app.snapshot(cx) else {
             return div().into_any_element();
         };
@@ -429,6 +444,23 @@ impl Render for TimelinePane {
             };
         }
 
+        if snap.v.search_open && !self.search_was_open {
+            let input = self.search.clone();
+            window.defer(cx, move |window, cx| {
+                input.update(cx, |s, cx| {
+                    s.focus(window, cx);
+                    s.select_all(window, cx);
+                })
+            });
+        }
+        self.search_was_open = snap.v.search_open;
+        let panel = if snap.v.search_open {
+            Some(search_panel(&snap, &self.search, cx).into_any_element())
+        } else if snap.v.pins_open {
+            Some(pins_panel(&snap, cx).into_any_element())
+        } else {
+            None
+        };
         let yt: HashMap<String, Option<YoutubePreview>> = self
             .yt
             .iter()
@@ -466,8 +498,252 @@ impl Render for TimelinePane {
                     .w(px(12.))
                     .child(timeline_scrollbar(&self.list)),
             )
+            .children(panel)
+            // Scrolled up: one click back to the newest. The list notifies this pane on
+            // every scroll, so `is_pinned` is current here.
+            .when(!self.is_pinned(), |d| {
+                d.child(
+                    div()
+                        .absolute()
+                        .bottom(px(16.))
+                        .right(px(24.))
+                        .rounded(theme::RADIUS_CONTROL)
+                        .shadow(theme::soft_shadow())
+                        .child(
+                            Btn::new("jump-latest", "Jump to latest")
+                                .icon(Icon::Chev)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.list.scroll_to_end();
+                                    cx.notify();
+                                })),
+                        ),
+                )
+            })
             .into_any_element()
     }
+}
+
+/// One message in a pinned or search list: author, time and body.
+struct Found {
+    op: OpRef,
+    name: String,
+    body: String,
+    at: i64,
+}
+
+fn found(item: &TimelineItem, keep: impl Fn(&str, bool) -> bool) -> Option<Found> {
+    match item {
+        TimelineItem::Message {
+            id,
+            author_name,
+            body,
+            at,
+            pinned,
+            ..
+        } if keep(body, *pinned) => Some(Found {
+            op: id.clone(),
+            name: author_name.clone(),
+            body: body.clone(),
+            at: *at,
+        }),
+        _ => None,
+    }
+}
+
+/// The pinned messages of this conversation, oldest first; a click brings one into view.
+fn pins_panel(snap: &AppSnapshot, cx: &mut Context<TimelinePane>) -> impl IntoElement {
+    let hits: Vec<Found> = snap.tl.iter().filter_map(|i| found(i, |_, p| p)).collect();
+    let empty = "Nothing pinned here yet. Hover a message and press the pin.";
+    panel(
+        "pins-panel",
+        "Pinned messages",
+        None,
+        hits,
+        empty,
+        true,
+        snap,
+        cx,
+    )
+}
+
+/// The query's matches among this conversation's loaded messages, newest first.
+fn search_panel(
+    snap: &AppSnapshot,
+    input: &Entity<InputState>,
+    cx: &mut Context<TimelinePane>,
+) -> impl IntoElement {
+    let query = input.read(cx).value().trim().to_lowercase();
+    let hits: Vec<Found> = if query.is_empty() {
+        Vec::new()
+    } else {
+        snap.tl
+            .iter()
+            .rev()
+            .filter_map(|i| found(i, |b, _| b.to_lowercase().contains(&query)))
+            .take(100)
+            .collect()
+    };
+    let empty = if query.is_empty() {
+        "Type to search the messages in this conversation."
+    } else {
+        "No messages match."
+    };
+    let field = div()
+        .mx(px(4.))
+        .mb(px(4.))
+        .h(px(34.))
+        .flex()
+        .items_center()
+        .px(px(10.))
+        .rounded(theme::RADIUS_CONTROL)
+        .border_1()
+        .border_color(theme::BORDER)
+        .bg(c::VOID)
+        .child(
+            Input::new(input)
+                .appearance(false)
+                .text_size(px(14.))
+                .text_color(theme::TEXT)
+                .px_0()
+                .py_0(),
+        )
+        .into_any_element();
+    panel(
+        "search-panel",
+        "Search",
+        Some(field),
+        hits,
+        empty,
+        false,
+        snap,
+        cx,
+    )
+}
+
+/// The floating list under the head. Pins close it on a click and carry an unpin button;
+/// search stays open so several results can be checked in turn.
+#[allow(clippy::too_many_arguments)]
+fn panel(
+    id: &'static str,
+    title: &'static str,
+    head: Option<AnyElement>,
+    hits: Vec<Found>,
+    empty: &'static str,
+    pins: bool,
+    snap: &AppSnapshot,
+    cx: &mut Context<TimelinePane>,
+) -> impl IntoElement {
+    let none = hits.is_empty();
+    let entries: Vec<AnyElement> = hits
+        .into_iter()
+        .enumerate()
+        .map(|(n, Found { op, name, body, at })| {
+            let jump = op.clone();
+            let ui = snap.ui.clone();
+            div()
+                .id((id, n))
+                .flex()
+                .gap(px(6.))
+                .items_start()
+                .px(px(10.))
+                .py(px(8.))
+                .rounded(theme::RADIUS_CONTROL)
+                .cursor_pointer()
+                .hover(|s| s.bg(theme::BG_HOVER))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.jump_to(&jump, cx);
+                    if pins {
+                        this.app.update(cx, |app, cx| {
+                            app.v_mut().pins_open = false;
+                            cx.notify();
+                        });
+                    }
+                }))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.))
+                        .child(
+                            div()
+                                .flex()
+                                .gap(px(8.))
+                                .items_baseline()
+                                .child(
+                                    div()
+                                        .text_size(px(13.))
+                                        .text_color(theme::TEXT_STRONG)
+                                        .child(name),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(theme::LABEL_TEXT)
+                                        .text_color(theme::TEXT_DIM)
+                                        .child(format::fmt_time(at)),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(13.))
+                                .text_color(theme::TEXT)
+                                .whitespace_nowrap()
+                                .overflow_hidden()
+                                .text_ellipsis()
+                                .child(body.chars().take(200).collect::<String>()),
+                        ),
+                )
+                .when(pins, |d| {
+                    d.child(
+                        icon_btn(("unpin", n), Icon::X, false)
+                            .tooltip(tooltip("Unpin"))
+                            .on_click(move |_, _, cx| {
+                                cx.stop_propagation();
+                                commands::pin_message(&ui, &op);
+                            }),
+                    )
+                })
+                .into_any_element()
+        })
+        .collect();
+    div()
+        .id(id)
+        .absolute()
+        .top(px(8.))
+        .right(px(20.))
+        .w(px(340.))
+        .max_h(px(420.))
+        .overflow_y_scroll()
+        .p(px(6.))
+        .flex()
+        .flex_col()
+        .bg(c::VOID)
+        .border_1()
+        .border_color(theme::BORDER)
+        .rounded(theme::RADIUS_FIELD)
+        .shadow(theme::soft_shadow())
+        .block_mouse_except_scroll()
+        .child(
+            div()
+                .px(px(10.))
+                .py(px(6.))
+                .text_size(theme::LABEL_TEXT)
+                .text_color(theme::TEXT_MUTED)
+                .child(title),
+        )
+        .children(head)
+        .when(none, |d| {
+            d.child(
+                div()
+                    .px(px(10.))
+                    .py(px(8.))
+                    .text_size(px(13.))
+                    .text_color(theme::TEXT_MUTED)
+                    .child(empty),
+            )
+        })
+        .children(entries)
 }
 
 /// A thin charcoal pill (4px, 3px off the edge), iron under the pointer. Same width in
@@ -543,8 +819,26 @@ pub fn render_head(snap: &AppSnapshot, window: &mut Window, _cx: &mut App) -> An
                 .flex()
                 .flex_none()
                 .gap(px(2.))
-                // The webview's Search button had no handler; kept as the same dead square.
-                .child(icon_btn("search", Icon::Search, false).tooltip(tooltip("Search")))
+                .child(
+                    icon_btn("toggle-pins", Icon::Pin, snap.v.pins_open)
+                        .tooltip(tooltip("Pinned messages"))
+                        .on_click(snap.app.listener(|app, _, _, cx| {
+                            let v = app.v_mut();
+                            v.pins_open ^= true;
+                            v.search_open = false;
+                            cx.notify();
+                        })),
+                )
+                .child(
+                    icon_btn("search", Icon::Search, snap.v.search_open)
+                        .tooltip(tooltip("Search"))
+                        .on_click(snap.app.listener(|app, _, _, cx| {
+                            let v = app.v_mut();
+                            v.search_open ^= true;
+                            v.pins_open = false;
+                            cx.notify();
+                        })),
+                )
                 .child(
                     icon_btn("toggle-members", Icon::Users, snap.v.members)
                         .tooltip(tooltip("Toggle member list"))
@@ -584,6 +878,7 @@ mod tests {
                 body: "y".into(),
             }),
             reactions: Vec::new(),
+            pinned: false,
         }
     }
 

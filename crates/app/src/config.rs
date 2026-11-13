@@ -419,6 +419,11 @@ pub struct PushToTalkConfig {
     /// Een onbekende naam valt bij het inlezen terug op `RightCtrl`.
     #[serde(default = "default_ptt_key")]
     pub key: String,
+
+    /// Hoe hard je minstens moet klinken voordat spraakdetectie de microfoon opent, in
+    /// procent van de niveaubalk in de instellingen (0 = alleen de VAD, 100 = vol).
+    #[serde(default)]
+    pub threshold: f32,
 }
 
 impl Default for PushToTalkConfig {
@@ -426,6 +431,7 @@ impl Default for PushToTalkConfig {
         Self {
             mode: default_ptt_mode(),
             key: default_ptt_key(),
+            threshold: 0.0,
         }
     }
 }
@@ -463,6 +469,17 @@ impl PushToTalkConfig {
                 self.key = default_ptt_key();
             }
         }
+        // `nan` parseert in TOML; die betekent niets, dus geen drempel.
+        if self.threshold.is_nan() {
+            self.threshold = 0.0;
+        }
+        self.threshold = self.threshold.clamp(0.0, 100.0);
+    }
+
+    /// De drempel als RMS-niveau voor `VoiceHandle::zet_drempel`. De niveaubalk in de
+    /// instellingen is vol bij een derde van de schaal (`self_level() * 3`), dus 100% = 1/3.
+    pub fn drempel(&self) -> f32 {
+        self.threshold / 300.0
     }
 
     /// De modus en toetscode zoals de audiolaag ze wil. Alleen aanroepen na `herstel`.
@@ -1123,6 +1140,7 @@ mod tests {
         let mut kapot = PushToTalkConfig {
             mode: "schreeuwen".into(),
             key: "Hyper".into(),
+            threshold: f32::NAN,
         };
         kapot.herstel();
         assert_eq!(kapot, PushToTalkConfig::default());
@@ -1130,12 +1148,14 @@ mod tests {
         let mut spelling = PushToTalkConfig {
             mode: " Mute ".into(),
             key: "mouse4".into(),
+            threshold: 250.0,
         };
         spelling.herstel();
         assert_eq!(
             (spelling.mode.as_str(), spelling.key.as_str()),
             ("mute", "Mouse4")
         );
+        assert_eq!(spelling.threshold, 100.0);
 
         let gezet = Config {
             push_to_talk: spelling,

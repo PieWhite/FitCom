@@ -135,6 +135,8 @@ pub struct Timeline {
     /// Reacties, per bericht gegroepeerd op emoji. Gesorteerd op `(doel, emoji)` zodat
     /// alle peers ze in dezelfde volgorde tonen; de peers binnen een groep op `PeerId`.
     pub reactions: Vec<Reaction>,
+    /// Vastgepinde berichten (`OpKind::Pin`), gesorteerd. Alleen berichten die er nog zijn.
+    pub pins: Vec<OpId>,
 }
 
 /// Sorteersleutel die op alle peers dezelfde uitkomst geeft. `wall_clock` mag hier
@@ -198,6 +200,8 @@ pub fn build(ops: &[Op]) -> Timeline {
     // Reacties: laatste-schrijver-wins per (doel, emoji, auteur) op `(lamport, author)`,
     // precies zoals Edit/Delete. De bool zegt of de reactie er op het eind nog staat.
     let mut reacties: HashMap<(OpId, String, PeerId), ReactieStem> = HashMap::new();
+    // Pins: laatste-schrijver-wins per doel, van wie ook. De bool zegt of hij vastzit.
+    let mut pins: HashMap<OpId, ((u64, PeerId), bool)> = HashMap::new();
 
     for op in sorted {
         // Onbekende soort: van een nieuwere peer. We bewaren en verspreiden hem wel,
@@ -382,6 +386,20 @@ pub fn build(ops: &[Op]) -> Timeline {
                     }
                 }
             }
+            OpKind::Pin { target, remove } => {
+                // Zelfde kanaalregel als bij een reactie: anders lekt een DM via het
+                // algemene kanaal.
+                if target.channel != op.channel {
+                    continue;
+                }
+                let k = key(op);
+                match pins.get(&target) {
+                    Some((prev, _)) if *prev >= k => {}
+                    _ => {
+                        pins.insert(target, (k, !remove));
+                    }
+                }
+            }
         }
     }
 
@@ -455,6 +473,14 @@ pub fn build(ops: &[Op]) -> Timeline {
         .collect();
     reactions.sort_unstable_by(|a, b| (&a.target, &a.emoji).cmp(&(&b.target, &b.emoji)));
 
+    // Een pin op een verwijderd bericht (of op iets dat geen bericht is) verdwijnt mee.
+    let mut pins: Vec<OpId> = pins
+        .into_iter()
+        .filter(|(target, (_, vast))| *vast && messages.iter().any(|m| m.id == *target))
+        .map(|(target, _)| target)
+        .collect();
+    pins.sort_unstable();
+
     Timeline {
         messages,
         nicknames: nicknames.into_iter().map(|(p, (_, n))| (p, n)).collect(),
@@ -477,6 +503,7 @@ pub fn build(ops: &[Op]) -> Timeline {
             })
             .collect(),
         reactions,
+        pins,
     }
 }
 
@@ -1276,6 +1303,41 @@ mod tests {
         let t = build(&[dm_bericht, kanaalvreemd]);
         assert_eq!(t.messages.len(), 1);
         assert!(t.reactions.is_empty());
+    }
+
+    #[test]
+    fn pin_is_gedeeld_laatste_wint_en_volgt_kanaal_en_verwijderen() {
+        let pin = |auteur, seq, lamport, doel, remove| {
+            op(
+                auteur,
+                seq,
+                lamport,
+                OpKind::Pin {
+                    target: doel,
+                    remove,
+                },
+            )
+        };
+        let bericht = op(peer(1), 1, 1, post("onthoud dit"));
+        let id = bericht.id();
+        let aan = pin(peer(2), 1, 2, id, false);
+        assert_eq!(build(&[bericht.clone(), aan.clone()]).pins, vec![id]);
+
+        // Iemand anders maakt hem later los: gedeeld, dus weg voor iedereen.
+        let los = pin(peer(3), 1, 3, id, true);
+        assert!(build(&[los.clone(), aan.clone(), bericht.clone()])
+            .pins
+            .is_empty());
+
+        // Verwijderd bericht neemt de pin mee.
+        let del = op(peer(1), 2, 4, OpKind::Delete { target: id });
+        assert!(build(&[bericht.clone(), aan, del]).pins.is_empty());
+
+        // Een algemene-op die naar een DM-bericht wijst telt niet.
+        let dm = op_in(Channel::dm(peer(2)), peer(1), 3, 5, post("onder ons"));
+        assert!(build(&[dm.clone(), pin(peer(2), 2, 6, dm.id(), false)])
+            .pins
+            .is_empty());
     }
 
     #[test]

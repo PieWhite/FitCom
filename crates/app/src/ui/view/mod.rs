@@ -360,6 +360,10 @@ pub struct ViewState {
     pub reply_to: Option<ReplyTo>,
     /// The message whose quick-emoji bar is open.
     pub emoji_for: Option<OpRef>,
+    /// The pinned-messages list over the timeline is open.
+    pub pins_open: bool,
+    /// The search panel over the timeline.
+    pub search_open: bool,
     /// Last moment we told the engine we were typing; one notification per 2.5 s window.
     pub last_typing_sent: Option<Instant>,
     pub ac_index: usize,
@@ -404,6 +408,8 @@ impl Default for ViewState {
             editing: None,
             reply_to: None,
             emoji_for: None,
+            pins_open: false,
+            search_open: false,
             last_typing_sent: None,
             ac_index: 0,
             ac_matches: Vec::new(),
