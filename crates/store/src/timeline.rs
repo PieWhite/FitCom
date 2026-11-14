@@ -57,6 +57,8 @@ pub struct FileEntry {
     pub hash: [u8; 32],
     /// Zie `Message::lamport`.
     pub lamport: u64,
+    /// Zie `Message::created_at`.
+    pub created_at: i64,
 }
 
 /// De uitslag van één peer op één Wordle-dag (2026-08-20).
@@ -289,6 +291,7 @@ pub fn build(ops: &[Op]) -> Timeline {
                         size,
                         hash,
                         lamport: op.lamport,
+                        created_at: klem_wall_clock(op.wall_clock),
                     },
                 ));
             }

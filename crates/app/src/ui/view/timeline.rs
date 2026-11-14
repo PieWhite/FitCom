@@ -957,7 +957,6 @@ mod tests {
                 action: "past".into(),
                 progress: 0,
                 results: Vec::new(),
-                scored: false,
             },
             msg("a", 12 * MIN, false, false),
         ];

@@ -76,13 +76,6 @@ const OPENBAAR_UUR: u32 = 7;
 /// kaart is een dag geldig en niemand mist iets als hij er een kwartier later staat.
 const HERPROBEER: Duration = Duration::from_secs(15 * 60);
 
-/// Een dag telt pas voor het scorebord als er minstens zoveel peers gespeeld hebben.
-/// Twee, niet drie: je krijgt geen punt voor alleen spelen, maar één peer op vakantie legt
-/// de competitie niet stil. Bewust een aantal en geen `peers.len()` — invariant 3 zegt dat
-/// nergens een 3 hardgecodeerd staat, en "minstens één tegenstander" is de regel die Alice
-/// bedoelde.
-const MIN_SPELERS: usize = 2;
-
 const ENDPOINT: &str = "https://www.nytimes.com/svc/wordle/v2/";
 const MAX_ANTWOORD: u64 = 16 * 1024;
 const TIMEOUT: Duration = Duration::from_secs(10);
@@ -558,8 +551,8 @@ pub struct Stand {
 
 /// De peers die op deze dag een punt krijgen.
 ///
-/// Leeg als de dag niet meetelt: minder dan [`MIN_SPELERS`] deelnemers (je krijgt geen
-/// punt voor alleen spelen), of niemand die het woord vond.
+/// Leeg als niemand het woord vond. Ook wie als enige speelde krijgt zijn punt
+/// (2026-11-14): de beste van de dag scoort, hoeveel anderen er ook meededen.
 ///
 /// **De minste pogingen wint, en bij gelijk de kortste speeltijd** (2026-08-30). Blijft
 /// het daarna nog gelijk — dezelfde seconde, of twee uitslagen zonder gemeten tijd — dan
@@ -575,9 +568,6 @@ pub struct Stand {
 ///
 /// `dag` is een aaneengesloten stuk uitslagen van één dag; `standen` snijdt die eruit.
 pub fn winnaars(dag: &[WordleEntry]) -> Vec<PeerId> {
-    if dag.len() < MIN_SPELERS {
-        return Vec::new();
-    }
     let tijd = |e: &WordleEntry| e.seconds.unwrap_or(u32::MAX);
     let Some(beste) = dag.iter().filter(|e| e.solved).map(|e| e.guesses).min() else {
         return Vec::new();
@@ -588,12 +578,6 @@ pub fn winnaars(dag: &[WordleEntry]) -> Vec<PeerId> {
         .filter(|e| tijd(e) == snelste)
         .map(|e| e.author)
         .collect()
-}
-
-/// Telt deze dag mee voor het scorebord? Zie [`MIN_SPELERS`]: met één speler is er geen
-/// wedstrijd, dus valt er ook niets te winnen.
-pub fn telt_mee(dag: &[WordleEntry]) -> bool {
-    dag.len() >= MIN_SPELERS
 }
 
 /// Het scorebord over alle dagen, hoogste punten eerst.
@@ -839,9 +823,11 @@ mod tests {
     }
 
     #[test]
-    fn alleen_spelen_levert_geen_punt_op() {
+    fn alleen_spelen_levert_ook_een_punt_op() {
         let dag = [uitslag(20_260_820, peer(1), 2, true)];
-        assert!(winnaars(&dag).is_empty(), "één speler is geen wedstrijd");
+        assert_eq!(winnaars(&dag), vec![peer(1)]);
+        let mislukt = [uitslag(20_260_820, peer(1), 6, false)];
+        assert!(winnaars(&mislukt).is_empty());
     }
 
     #[test]
@@ -907,9 +893,8 @@ mod tests {
     }
 
     #[test]
-    fn een_verliezer_kan_de_dag_wel_laten_meetellen() {
-        // Twee spelers, één opgelost: de dag telt (er was een tegenstander) en de
-        // oplosser krijgt zijn punt.
+    fn alleen_de_oplosser_krijgt_een_punt() {
+        // Twee spelers, één opgelost: de oplosser krijgt zijn punt.
         let dag = [
             uitslag(20_260_820, peer(1), 4, true),
             uitslag(20_260_820, peer(2), 6, false),
@@ -919,8 +904,8 @@ mod tests {
 
     #[test]
     fn het_scorebord_telt_per_dag_en_niet_per_uitslag() {
-        // Twee dagen. Dag 1: peer 1 wint met 3. Dag 2: gelijkspel op 4. Dag 3: peer 2
-        // speelde alleen en scoort dus niets.
+        // Dag 1: peer 1 wint met 3. Dag 2: gelijkspel op 4. Dag 3: peer 2 speelde alleen
+        // en scoort ook.
         let uitslagen = [
             uitslag(20_260_818, peer(1), 3, true),
             uitslag(20_260_818, peer(2), 4, true),
@@ -930,13 +915,14 @@ mod tests {
         ];
         let stand = standen(&uitslagen);
         assert_eq!(stand.len(), 2);
-        assert_eq!(stand[0].peer, peer(1));
-        assert_eq!(stand[0].punten, 2); // dag 1 gewonnen, dag 2 gelijk
-        assert_eq!(stand[0].gespeeld, 2);
-        assert_eq!(stand[1].peer, peer(2));
-        assert_eq!(stand[1].punten, 1); // alleen dag 2
-        assert_eq!(stand[1].gespeeld, 3);
-        assert_eq!(stand[1].opgelost, 3);
+        // Gelijk op punten; peer 2 loste vaker op en staat dus bovenaan.
+        assert_eq!(stand[0].peer, peer(2));
+        assert_eq!(stand[0].punten, 2); // dag 2 gelijk, dag 3 alleen
+        assert_eq!(stand[0].gespeeld, 3);
+        assert_eq!(stand[0].opgelost, 3);
+        assert_eq!(stand[1].peer, peer(1));
+        assert_eq!(stand[1].punten, 2); // dag 1 gewonnen, dag 2 gelijk
+        assert_eq!(stand[1].gespeeld, 2);
     }
 
     #[test]

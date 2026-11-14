@@ -220,6 +220,8 @@ pub struct FileView {
     /// Zie `fitcom_store::timeline::Message::lamport` — bepaalt waar dit bestand tussen
     /// de berichten in de tijdlijn komt te staan.
     pub lamport: u64,
+    /// Zie `fitcom_store::timeline::Message::created_at`.
+    pub created_at: i64,
     /// Voor een afbeelding: samen met `name`'s extensie het pad in `pictures_dir` waar
     /// de UI een miniatuur vandaan kan laden, zie `files::hash_bestandsnaam`.
     pub hash: [u8; 32],
@@ -4077,6 +4079,7 @@ impl Engine {
                 is_mine: f.author == me,
                 status: self.files.status(f.id).cloned(),
                 lamport: f.lamport,
+                created_at: f.created_at,
                 hash: f.hash,
                 local_path: self.files.lokaal_pad(f.id).map(Path::to_path_buf),
             })
@@ -5200,6 +5203,7 @@ mod afbeeldingenmap_tests {
             size: 10,
             hash: [0u8; 32],
             lamport: 1,
+            created_at: 0,
         };
 
         let afbeelding = deelpad_van(&maak("plaatje.png"), downloads, pictures);

@@ -228,7 +228,6 @@ pub fn render_card(
         action,
         progress,
         results,
-        scored,
     } = item
     else {
         return div().into_any_element();
@@ -280,16 +279,6 @@ pub fn render_card(
             }
             .into(),
         )
-    } else if !scored {
-        let first = &results[0];
-        let who = if first.mine {
-            "You".to_string()
-        } else {
-            first.name.clone()
-        };
-        Some(format!(
-            "{who} played alone, so this day is worth no point yet. It counts as soon as somebody else joins in."
-        ))
     } else if !spoilers {
         Some("The squares appear once you have finished your own game.".into())
     } else {

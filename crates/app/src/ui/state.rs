@@ -400,9 +400,6 @@ pub enum TimelineItem {
         progress: u8,
         /// Everyone who played, best score first.
         results: Vec<WordleScore>,
-        /// Did this day count for points? False while only one peer has played — you get
-        /// no point for playing alone. See `crate::wordle::winnaars`.
-        scored: bool,
     },
 }
 
@@ -1338,7 +1335,8 @@ pub fn timeline_of(
         items.push((
             f.lamport,
             f.author,
-            0,
+            // Its own clock, so a pasted image lands after the Wordle card like a message.
+            f.created_at,
             TimelineItem::File {
                 id: OpRef::of(f.id),
                 author: f.author.to_string(),
@@ -1374,9 +1372,8 @@ pub fn timeline_of(
     items.sort_by_key(|(lamport, author, _, _)| (*lamport, *author));
 
     // The daily Wordle card is not an op, so it has no lamport to sort on — it is placed
-    // by the clock instead, right before the first thing said after 07:00 that day. A file
-    // carries no clock of its own (`at == 0`) and inherits the last one seen, the same way
-    // the frontend draws it.
+    // by the clock instead, right before the first thing said or posted after 07:00 that
+    // day. An item without a clock (`at == 0`) inherits the last one seen.
     let mut kaarten = if channel == Channel::GENERAL {
         let mut k = wordle_cards(snap, me, &hues);
         if let Some(c) = snap.clips.as_ref().and_then(|c| c.kaart.as_ref()) {
@@ -1557,7 +1554,6 @@ fn wordle_cards(
                         0
                     },
                     results,
-                    scored: wordle::telt_mee(groep),
                 },
             )
         })
