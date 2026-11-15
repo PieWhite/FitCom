@@ -137,7 +137,7 @@ pub struct Timeline {
     /// Reacties, per bericht gegroepeerd op emoji. Gesorteerd op `(doel, emoji)` zodat
     /// alle peers ze in dezelfde volgorde tonen; de peers binnen een groep op `PeerId`.
     pub reactions: Vec<Reaction>,
-    /// Vastgepinde berichten (`OpKind::Pin`), gesorteerd. Alleen berichten die er nog zijn.
+    /// Vastgepinde berichten en bestanden (`OpKind::Pin`), gesorteerd op ID.
     pub pins: Vec<OpId>,
 }
 
@@ -476,10 +476,14 @@ pub fn build(ops: &[Op]) -> Timeline {
         .collect();
     reactions.sort_unstable_by(|a, b| (&a.target, &a.emoji).cmp(&(&b.target, &b.emoji)));
 
-    // Een pin op een verwijderd bericht (of op iets dat geen bericht is) verdwijnt mee.
+    // Alleen nog zichtbare berichten en bestanden kunnen een pin hebben.
     let mut pins: Vec<OpId> = pins
         .into_iter()
-        .filter(|(target, (_, vast))| *vast && messages.iter().any(|m| m.id == *target))
+        .filter(|(target, (_, vast))| {
+            *vast
+                && (messages.iter().any(|m| m.id == *target)
+                    || files.iter().any(|f| f.id == *target))
+        })
         .map(|(target, _)| target)
         .collect();
     pins.sort_unstable();
@@ -1341,6 +1345,47 @@ mod tests {
         assert!(build(&[dm.clone(), pin(peer(2), 2, 6, dm.id(), false)])
             .pins
             .is_empty());
+    }
+
+    #[test]
+    fn afbeelding_vastzetten_losmaken_en_verwijderen() {
+        let afbeelding = op(
+            peer(1),
+            1,
+            1,
+            OpKind::FileMeta {
+                name: "screenshot.png".into(),
+                size: 100,
+                hash: [0; 32],
+            },
+        );
+        let target = afbeelding.id();
+        let pin = op(
+            peer(2),
+            1,
+            2,
+            OpKind::Pin {
+                target,
+                remove: false,
+            },
+        );
+        let los = op(
+            peer(2),
+            2,
+            3,
+            OpKind::Pin {
+                target,
+                remove: true,
+            },
+        );
+        let verwijderd = op(peer(1), 2, 4, OpKind::Delete { target });
+
+        assert!(build(std::slice::from_ref(&pin)).pins.is_empty());
+        assert_eq!(build(&[pin.clone(), afbeelding.clone()]).pins, vec![target]);
+        assert!(build(&[los, pin.clone(), afbeelding.clone()])
+            .pins
+            .is_empty());
+        assert!(build(&[afbeelding, pin, verwijderd]).pins.is_empty());
     }
 
     #[test]

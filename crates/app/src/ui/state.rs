@@ -347,6 +347,8 @@ pub enum TimelineItem {
         size: u64,
         at: i64,
         mine: bool,
+        #[serde(default)]
+        pinned: bool,
         transfer: TransferState,
         /// Absolute path in the content-addressed picture folder, for an image whose
         /// bytes are actually on this machine and that fits [`MAX_INLINE_SIDE`]. The
@@ -1348,6 +1350,7 @@ pub fn timeline_of(
                 // the message they were dropped next to, which is what `lamport` orders.
                 at: 0,
                 mine: f.is_mine,
+                pinned: snap.timeline.pins.contains(&f.id),
                 transfer: match (&f.status, f.is_mine) {
                     (_, true) => TransferState::Mine,
                     (None, _) => TransferState::Available,
@@ -1974,6 +1977,7 @@ mod tests {
                 size: 9,
                 at: 0,
                 mine: false,
+                pinned: true,
                 transfer: TransferState::Running {
                     received: 1,
                     total: 9,

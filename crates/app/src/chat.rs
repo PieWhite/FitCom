@@ -161,7 +161,7 @@ impl Chat {
         )
     }
 
-    /// Pint een bericht vast in zijn kanaal, of maakt hem los als hij nu vastzit. Gedeeld:
+    /// Pint een bericht of bestand vast, of maakt het los als het nu vastzit. Gedeeld:
     /// voor iedereen in het kanaal.
     pub fn pin(&mut self, doel: OpId) -> Result<Vec<MeshCommand>> {
         let vast = self.timeline().pins.contains(&doel);

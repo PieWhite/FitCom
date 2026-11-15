@@ -322,7 +322,7 @@ op_kinds! {
     // verkleind; de ontvanger controleert formaat en afmeting zelf voordat hij hem op
     // schijf zet (`crate::avatar` in de app). Additief, geen protocolbump.
     32 => SetAvatar { image: serde_bytes::ByteBuf },
-    // Een bericht vastpinnen in zijn kanaal (2026-11-13). Gedeeld: per doel wint de laatste
+    // Een bericht of bestand vastpinnen in zijn kanaal. Gedeeld: per doel wint de laatste
     // `(lamport, author)`, ongeacht wie — iedereen mag pinnen en losmaken, zoals bij een
     // reactie. Zelfde kanaalregel als `React` (zie `fitcom_store::timeline`). Additief, geen
     // protocolbump: een oudere peer bewaart en verspreidt hem zonder hem te tonen. Bewust

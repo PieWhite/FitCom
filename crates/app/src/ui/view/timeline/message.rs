@@ -209,7 +209,10 @@ fn render_message(
         });
 
     let mut body = div().flex_1().min_w_0().relative().flex().flex_col();
-    if let TimelineItem::Message { pinned: true, .. } = item {
+    if matches!(
+        item,
+        TimelineItem::Message { pinned: true, .. } | TimelineItem::File { pinned: true, .. }
+    ) {
         body = body.child(pinned_mark());
     }
     if let TimelineItem::Message {
@@ -685,7 +688,7 @@ fn actions(ctx: &RowCtx, ix: usize, item: &TimelineItem, key: &SharedString) -> 
                 ),
         );
     }
-    if let TimelineItem::Message { pinned, .. } = item {
+    if let TimelineItem::Message { pinned, .. } | TimelineItem::File { pinned, .. } = item {
         let (ui, op) = (ctx.snap.ui.clone(), id.clone());
         strip = strip.child(
             plain(button("pin"))

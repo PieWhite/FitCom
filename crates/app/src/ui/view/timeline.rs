@@ -25,11 +25,13 @@ use super::{format, markup, AppHandle, AppSnapshot, PaneInit, View};
 use gpui_kit::base::{Scrollbar, ScrollbarMode};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::{
-    div, list, prelude::FluentBuilder, px, AnyElement, App, AppContext, Context, Entity,
-    InteractiveElement, IntoElement, ListAlignment, ListState, ParentElement, Pixels, Point,
-    Render, StatefulInteractiveElement, Styled, Subscription, WeakEntity, Window,
+    div, img, list, prelude::FluentBuilder, px, AnyElement, App, AppContext, Context, Entity,
+    InteractiveElement, IntoElement, ListAlignment, ListState, ObjectFit, ParentElement, Pixels,
+    Point, Render, StatefulInteractiveElement, Styled, StyledImage, Subscription, WeakEntity,
+    Window,
 };
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -523,12 +525,13 @@ impl Render for TimelinePane {
     }
 }
 
-/// One message in a pinned or search list: author, time and body.
+/// An entry in the pinned or search list.
 struct Found {
     op: OpRef,
     name: String,
     body: String,
     at: i64,
+    image_path: Option<String>,
 }
 
 fn found(item: &TimelineItem, keep: impl Fn(&str, bool) -> bool) -> Option<Found> {
@@ -545,6 +548,7 @@ fn found(item: &TimelineItem, keep: impl Fn(&str, bool) -> bool) -> Option<Found
             name: author_name.clone(),
             body: body.clone(),
             at: *at,
+            image_path: None,
         }),
         _ => None,
     }
@@ -552,7 +556,28 @@ fn found(item: &TimelineItem, keep: impl Fn(&str, bool) -> bool) -> Option<Found
 
 /// The pinned messages of this conversation, oldest first; a click brings one into view.
 fn pins_panel(snap: &AppSnapshot, cx: &mut Context<TimelinePane>) -> impl IntoElement {
-    let hits: Vec<Found> = snap.tl.iter().filter_map(|i| found(i, |_, p| p)).collect();
+    let hits: Vec<Found> = snap
+        .tl
+        .iter()
+        .filter_map(|item| match item {
+            TimelineItem::File {
+                id,
+                author_name,
+                name,
+                at,
+                image_path,
+                pinned: true,
+                ..
+            } => Some(Found {
+                op: id.clone(),
+                name: author_name.clone(),
+                body: name.clone(),
+                at: *at,
+                image_path: image_path.clone(),
+            }),
+            _ => found(item, |_, pinned| pinned),
+        })
+        .collect();
     let empty = "Nothing pinned here yet. Hover a message and press the pin.";
     panel(
         "pins-panel",
@@ -637,7 +662,23 @@ fn panel(
     let entries: Vec<AnyElement> = hits
         .into_iter()
         .enumerate()
-        .map(|(n, Found { op, name, body, at })| {
+        .map(|(n, hit)| {
+            let Found {
+                op,
+                name,
+                body,
+                at,
+                image_path,
+            } = hit;
+            let thumbnail = image_path
+                .as_deref()
+                .and_then(|path| picture(&snap.ui, Path::new(path)))
+                .map(|source| {
+                    img(source)
+                        .size(px(44.))
+                        .flex_none()
+                        .object_fit(ObjectFit::Contain)
+                });
             let jump = op.clone();
             let ui = snap.ui.clone();
             div()
@@ -659,6 +700,7 @@ fn panel(
                         });
                     }
                 }))
+                .children(thumbnail)
                 .child(
                     div()
                         .flex_1()
@@ -677,12 +719,14 @@ fn panel(
                                         .text_color(theme::TEXT_STRONG)
                                         .child(name),
                                 )
-                                .child(
-                                    div()
-                                        .text_size(theme::LABEL_TEXT)
-                                        .text_color(theme::TEXT_DIM)
-                                        .child(format::fmt_time(at)),
-                                ),
+                                .when(at != 0, |d| {
+                                    d.child(
+                                        div()
+                                            .text_size(theme::LABEL_TEXT)
+                                            .text_color(theme::TEXT_DIM)
+                                            .child(format::fmt_time(at)),
+                                    )
+                                }),
                         )
                         .child(
                             div()
@@ -896,6 +940,7 @@ mod tests {
             size: 1,
             at: 0,
             mine: false,
+            pinned: false,
             transfer: TransferState::Available,
             image_path: None,
             local_path: None,
